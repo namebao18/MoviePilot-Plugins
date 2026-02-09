@@ -1,0 +1,18 @@
+{
+  "autosubv2": {
+    "name": "AI字幕自动生成(v2)",
+    "description": "使用whisper自动生成视频文件字幕,使用大模型翻译字幕成中文。",
+    "version": "2.5",
+    "icon": "autosubtitles.jpeg",
+    "author": "TimoYoung",
+    "level": 2
+  },
+  "dynamicwechat": {
+    "name": "修改企业微信可信IP",
+    "description": "优先使用cookie更新IP。",
+    "version": "1.1.2",
+    "icon": "Wecom_A.png",
+    "author": "RamenRa",
+    "level": 2
+  }
+}
