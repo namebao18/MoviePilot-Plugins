@@ -23,7 +23,7 @@
     "author": "suraxiuxiu",
     "level": 2
   },
-  "ChatGPT": {
+  "chatgpt": {
     "name": "ChatGPT (自定义LLM)",
     "description": "使用 MoviePilot 系统智能助手或自定义 LLM 配置增强媒体名称识别。支持系统、Agent Tokens、自定义 LLM 三种模式。",
     "version": "4.0.0",
