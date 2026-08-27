@@ -1,0 +1,8 @@
+{
+  "name": "企微配置IPpw版",
+  "description": "定时获取最新动态公网IP，配置到企业微信应用的可信IP列表里。",
+  "version": "3.0.0",
+  "icon": "micon.png",
+  "author": "suraxiuxiu",
+  "level": 2
+}
