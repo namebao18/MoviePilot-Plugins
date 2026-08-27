@@ -1,0 +1,8 @@
+{
+  "name": "LLM 供应商修复",
+  "description": "确保 Agent 始终使用系统 LLM 配置，不受 Agent Tokens 管理插件影响，避免 Agent 与 ChatGPT 等插件互相干扰。",
+  "version": "2.0.0",
+  "icon": "llmfix.png",
+  "author": "local",
+  "level": 1
+}
