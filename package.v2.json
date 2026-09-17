@@ -1,19 +1,35 @@
 {
-  "name": "package.v2.json",
-  "path": "package.v2.json",
-  "sha": "54a702b2fd51c9e04592067c7da368c3e8b807df",
-  "size": 1153,
-  "url": "https://api.github.com/repos/namebao18/MoviePilot-Plugins/contents/package.v2.json?ref=main",
-  "html_url": "https://github.com/namebao18/MoviePilot-Plugins/blob/main/package.v2.json",
-  "git_url": "https://api.github.com/repos/namebao18/MoviePilot-Plugins/git/blobs/54a702b2fd51c9e04592067c7da368c3e8b807df",
-  "download_url": "https://raw.githubusercontent.com/namebao18/MoviePilot-Plugins/main/package.v2.json",
-  "type": "file",
-  "content": "ew0KICAibGxtcHJvdmlkZXJmaXgiOiB7DQogICAgIm5hbWUiOiAiTExNIOS+\nm+W6lOWVhuS/ruWkjSIsDQogICAgImRlc2NyaXB0aW9uIjogIuehruS/nSBB\nZ2VudCDlp4vnu4jkvb/nlKjns7vnu58gTExNIOmFjee9ru+8jOS4jeWPlyBB\nZ2VudCBUb2tlbnMg566h55CG5o+S5Lu25b2x5ZON44CCIiwNCiAgICAidmVy\nc2lvbiI6ICIyLjAuMCIsDQogICAgImljb24iOiAibGxtZml4LnBuZyIsDQog\nICAgImF1dGhvciI6ICJsb2NhbCIsDQogICAgImxldmVsIjogMQ0KICB9LA0K\nICAiYXV0b3N1YnYyIjogew0KICAgICJuYW1lIjogIkFJ5a2X5bmV6Ieq5Yqo\n55Sf5oiQKHYyKSIsDQogICAgImRlc2NyaXB0aW9uIjogIuS9v+eUqHdoaXNw\nZXLoh6rliqjnlJ/miJDop4bpopHmlofku7blrZfluZUs5L2/55So5aSn5qih\n5Z6L57+76K+R5a2X5bmV5oiQ5Lit5paH44CCIiwNCiAgICAidmVyc2lvbiI6\nICIzLjAuMCIsDQogICAgImljb24iOiAiYXV0b3N1YnRpdGxlcy5qcGVnIiwN\nCiAgICAiYXV0aG9yIjogIlRpbW9Zb3VuZyIsDQogICAgImxldmVsIjogMQ0K\nICB9LA0KICAid2V3b3JraXBwdyI6IHsNCiAgICAibmFtZSI6ICLkvIHlvq7p\nhY3nva5JUHB354mIIiwNCiAgICAiZGVzY3JpcHRpb24iOiAi5a6a5pe26I63\n5Y+W5pyA5paw5Yqo5oCB5YWs572RSVDvvIzphY3nva7liLDkvIHkuJrlvq7k\nv6HlupTnlKjnmoTlj6/kv6FJUOWIl+ihqOmHjOOAgiIsDQogICAgInZlcnNp\nb24iOiAiMy4wLjAiLA0KICAgICJpY29uIjogIm1pY29uLnBuZyIsDQogICAg\nImF1dGhvciI6ICJzdXJheGl1eGl1IiwNCiAgICAibGV2ZWwiOiAyDQogIH0s\nDQogICJjaGF0Z3B0Ijogew0KICAgICJuYW1lIjogIkNoYXRHUFQgKOiHquWu\nmuS5iUxMTSkiLA0KICAgICJkZXNjcmlwdGlvbiI6ICLkvb/nlKggTW92aWVQ\naWxvdCDns7vnu5/mmbrog73liqnmiYvmiJboh6rlrprkuYkgTExNIOmFjee9\nruWinuW8uuWqkuS9k+WQjeensOivhuWIq+OAguaUr+aMgeezu+e7n+OAgUFn\nZW50IFRva2Vuc+OAgeiHquWumuS5iSBMTE0g5LiJ56eN5qih5byP44CCIiwN\nCiAgICAidmVyc2lvbiI6ICI0LjAuMCIsDQogICAgImljb24iOiAiY2hhdGdw\ndC5wbmciLA0KICAgICJhdXRob3IiOiAianh4Z2hwIChsb2NhbCBtb2RpZmll\nZCkiLA0KICAgICJsZXZlbCI6IDINCiAgfQ0KfQ==\n",
-  "encoding": "base64",
-  "_links": {
-    "self": "https://api.github.com/repos/namebao18/MoviePilot-Plugins/contents/package.v2.json?ref=main",
-    "git": "https://api.github.com/repos/namebao18/MoviePilot-Plugins/git/blobs/54a702b2fd51c9e04592067c7da368c3e8b807df",
-    "html": "https://github.com/namebao18/MoviePilot-Plugins/blob/main/package.v2.json"
+  "llmproviderfix": {
+    "name": "LLM 供应商修复",
+    "description": "确保 Agent 始终使用系统 LLM 配置，不受 Agent Tokens 管理插件影响。",
+    "version": "2.0.0",
+    "icon": "llmfix.png",
+    "author": "local",
+    "level": 1
+  },
+  "autosubv2": {
+    "name": "AI字幕自动生成(v2)",
+    "description": "使用whisper自动生成视频文件字幕,使用大模型翻译字幕成中文。",
+    "version": "3.0.0",
+    "icon": "autosubtitles.jpeg",
+    "author": "TimoYoung",
+    "level": 1
+  },
+  "weworkippw": {
+    "name": "企微配置IPpw版",
+    "description": "定时获取最新动态公网IP，配置到企业微信应用的可信IP列表里。",
+    "version": "3.0.0",
+    "icon": "micon.png",
+    "author": "suraxiuxiu",
+    "level": 2
+  },
+  "chatgpt": {
+    "name": "ChatGPT (自定义LLM)",
+    "description": "使用 MoviePilot 系统智能助手或自定义 LLM 配置增强媒体名称识别。支持系统、Agent Tokens、自定义 LLM 三种模式。",
+    "version": "4.0.0",
+    "icon": "chatgpt.png",
+    "author": "jxxghp (local modified)",
+    "level": 2
   },
   "AutoSignIn": {
     "name": "站点自动签到",
