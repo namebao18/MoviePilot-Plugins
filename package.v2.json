@@ -1,5 +1,5 @@
 {
-  "llmproviderfix": {
+  "LLMProviderFix": {
     "name": "LLM 供应商修复",
     "description": "确保 Agent 始终使用系统 LLM 配置，不受 Agent Tokens 管理插件影响。",
     "version": "2.0.0",
@@ -7,7 +7,7 @@
     "author": "local",
     "level": 1
   },
-  "autosubv2": {
+  "AutoSubv2": {
     "name": "AI字幕自动生成(v2)",
     "description": "使用whisper自动生成视频文件字幕,使用大模型翻译字幕成中文。",
     "version": "3.0.0",
@@ -15,7 +15,7 @@
     "author": "TimoYoung",
     "level": 1
   },
-  "weworkippw": {
+  "WeWorkIPPW": {
     "name": "企微配置IPpw版",
     "description": "定时获取最新动态公网IP，配置到企业微信应用的可信IP列表里。",
     "version": "3.0.0",
@@ -23,7 +23,7 @@
     "author": "suraxiuxiu",
     "level": 2
   },
-  "chatgpt": {
+  "ChatGPT": {
     "name": "ChatGPT (自定义LLM)",
     "description": "使用 MoviePilot 系统智能助手或自定义 LLM 配置增强媒体名称识别。支持系统、Agent Tokens、自定义 LLM 三种模式。",
     "version": "4.0.0",
