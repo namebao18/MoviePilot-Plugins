@@ -1,0 +1,8 @@
+{
+  "name": "站点自动签到",
+  "description": "自动模拟登录、签到站点。（本地改造：仅失败时推送摘要，签到与登录合并为一条通知）",
+  "version": "9.9.10",
+  "icon": "signin.png",
+  "author": "thsrite (local modified)",
+  "level": 2
+}
