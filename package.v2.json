@@ -38,5 +38,13 @@
     "icon": "signin.png",
     "author": "thsrite (local modified)",
     "level": 2
+  },
+  "AutoSubv2AV": {
+    "name": "AI字幕自动生成(成人特调)",
+    "description": "针对成人影片库特调：NFO语言判断+中文广告跳过+板块过滤。使用whisper从音轨生成字幕，翻译交青龙脚本。",
+    "version": "1.0.0",
+    "icon": "autosubtitles.jpeg",
+    "author": "TimoYoung (AV modified)",
+    "level": 2
   }
 }
