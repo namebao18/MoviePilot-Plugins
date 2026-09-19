@@ -58,7 +58,7 @@ class TaskItem:
 
 class AutoSubv2AV(_PluginBase):
     # 插件名称
-    plugin_name = "AI字幕自动生成(成人特调)"
+    plugin_name = "AI字幕自动生成(特调)"
     # 插件描述
     plugin_desc = "针对成人影片库特调：NFO语言判断 + 中文广告跳过 + 板块过滤。使用whisper从音轨生成字幕，翻译交青龙脚本。"
     # 插件图标
@@ -113,6 +113,10 @@ class AutoSubv2AV(_PluginBase):
     _board_lang_map = None          # 板块语言映射（dict）
     _ad_skip_seconds = None         # 广告跳过秒数（仅非中文片）
     _skip_nfo_chinese = None        # NFO 有中文字幕标签则跳过
+    _check_zh_subtitle = None       # 检查已有中文字幕则跳过（2026-09-19 新增）
+    _timed_scrape = None            # 内置定时全量扫描（2026-09-19 新增）
+    _timed_interval_hours = None    # 定时间隔（小时）
+    _exclude_extras = None          # 排除 extras/extrafanart 目录（2026-09-19 新增）
 
     # 默认板块语言映射
     _DEFAULT_BOARD_LANG = {
@@ -127,6 +131,8 @@ class AutoSubv2AV(_PluginBase):
     ]
     # 中文语言代码
     _ZH_LANGS = ('zh', 'chi', 'zho', 'zh-cn', 'zhs', 'zh-hans', 'chs', 'cn', 'zh-tw', 'cht', 'zh-hant')
+
+    _timed_thread = None            # 定时线程（2026-09-19）
 
     # 语言偏好映射：选项值 -> (语言代码列表, 严格匹配)
     _LANG_MAP = {
@@ -158,8 +164,13 @@ class AutoSubv2AV(_PluginBase):
         self._enable_asr = config.get('enable_asr', True)
         if self._enable_asr:
             self._faster_whisper_model = config.get('faster_whisper_model', 'base')
-            self._faster_whisper_model_path = config.get('faster_whisper_model_path',
-                                                         self.get_data_path() / "faster-whisper-models")
+            # ===== 特调：复用 AutoSubv2 的模型目录（避免重复下载 2.9G） =====
+            # 2026-09-19：优先用 AutoSubv2 已下载的模型
+            _as2_model = self.get_data_path().parent / "AutoSubv2" / "faster-whisper-models"
+            self._faster_whisper_model_path = config.get(
+                'faster_whisper_model_path',
+                _as2_model if _as2_model.exists() else self.get_data_path() / "faster-whisper-models"
+            )
             self._huggingface_proxy = config.get('proxy', True)
             self._auto_detect_language = config.get('auto_detect_language', False)
             self._cpu_threads = int(config.get('cpu_threads', 2))
@@ -184,6 +195,13 @@ class AutoSubv2AV(_PluginBase):
         except Exception:
             self._ad_skip_seconds = 300
         self._skip_nfo_chinese = config.get('skip_nfo_chinese', True)
+        self._check_zh_subtitle = config.get('check_zh_subtitle', True)
+        self._timed_scrape = config.get('timed_scrape', False)
+        try:
+            self._timed_interval_hours = float(config.get('timed_interval_hours', 12))
+        except Exception:
+            self._timed_interval_hours = 12.0
+        self._exclude_extras = config.get('exclude_extras', False)
         self._translate_zh = config.get('translate_zh', False)
         if self._translate_zh:
             use_chatgpt = config.get('use_chatgpt', True)
@@ -241,6 +259,10 @@ class AutoSubv2AV(_PluginBase):
                 self.update_config(config)
                 logger.info("立即运行一次")
                 self._run_at_once(path_list=self._path_list)
+
+            # ===== 特调：内置定时全量扫描（2026-09-19）=====
+            if self._timed_scrape:
+                self.__start_timed_scrape()
         else:
             self.stop_service()
 
@@ -294,6 +316,11 @@ class AutoSubv2AV(_PluginBase):
         if self.__is_duplicate_task(task.video_file):
             logger.info(f"任务已存在，跳过添加：{video_file}")
             return False
+
+        # 特调：已完成过的任务也跳过（避免每次全量重新入队）
+        for t in (self._tasks or {}).values():
+            if t.video_file == task.video_file and t.status in (TaskStatus.COMPLETED, TaskStatus.IGNORED):
+                return False
 
         self._task_queue.put(task)
         self._tasks[task.task_id] = task
@@ -376,6 +403,38 @@ class AutoSubv2AV(_PluginBase):
                     self.add_task(video_file, TaskSource.MANUAL)
             elif os.path.splitext(path)[-1].lower() in settings.RMT_MEDIAEXT:
                 self.add_task(path, TaskSource.MANUAL)
+
+    def __start_timed_scrape(self):
+        """特调：启动内置定时全量扫描（2026-09-19 新增，类似 mdcx 的 timed_scrape）"""
+        if self._timed_thread and self._timed_thread.is_alive():
+            return
+        interval_h = self._timed_interval_hours or 12.0
+        logger.info(f"[特调] 已启用内置定时全量扫描，间隔 {interval_h} 小时")
+
+        def _loop():
+            # 首次延迟 5 分钟启动（避开 MP 启动期）
+            time.sleep(300)
+            while not self._event.is_set():
+                try:
+                    logger.info("[特调] 定时全量扫描开始")
+                    # 重新读 path_list（用配置里的）
+                    cfg = self.get_config() or {}
+                    pl = cfg.get('path_list') or ''
+                    paths = [x.strip() for x in pl.replace('\r', '').split('\n') if x.strip()]
+                    if paths:
+                        self._run_at_once(path_list=paths)
+                    else:
+                        logger.warning("[特调] path_list 为空，跳过定时扫描")
+                except Exception as e:
+                    logger.error(f"[特调] 定时扫描异常: {e}")
+                # 等待间隔
+                for _ in range(int(interval_h * 3600)):
+                    if self._event.is_set():
+                        break
+                    time.sleep(1)
+
+        self._timed_thread = threading.Thread(target=_loop, daemon=True)
+        self._timed_thread.start()
 
     def __check_asr(self):
         if not self._faster_whisper_model_path or not self._faster_whisper_model:
@@ -611,7 +670,7 @@ class AutoSubv2AV(_PluginBase):
                 if clip_start and clip_start > 0:
                     _ct = str(int(clip_start))
                     _vad = False  # clip_timestamps 与 vad_filter 互斥
-                    logger.info(f"[成人特调] 使用 clip_timestamps={_ct} 跳过开头（避开中文广告）")
+                    logger.info(f"[特调] 使用 clip_timestamps={_ct} 跳过开头（避开中文广告）")
                 segments, info = model.transcribe(audio_file,
                                                   language=lang if lang != 'auto' else None,
                                                   word_timestamps=True,
@@ -708,15 +767,15 @@ class AutoSubv2AV(_PluginBase):
             logger.info(f"字幕源偏好：{self._translate_preference} 获取音轨元数据失败")
             return False, None, None
 
-        # ===== 成人特调：优先用 NFO/板块判定的语言（覆盖音轨元数据） =====
+        # ===== 特调：NFO/板块判定的语言【优先级最高】 =====
+        # （2026-09-19 修复：原先 auto_detect_language 会覆盖此判定，导致 NFO 白判）
         forced_lang = self.__resolve_lang(video_file)
         if forced_lang:
-            logger.info(f"[成人特调] 语言判定为 {forced_lang}（来源={self._lang_source}）")
+            logger.info(f"[特调] 语言判定为 {forced_lang}（来源={self._lang_source}）")
             audio_lang = forced_lang
-        
-        # 如果开启了自动语言检测，直接设置为auto，跳过metadata的语言信息
-        if self._auto_detect_language:
-            logger.info("已开启自动语言检测，将使用whisper模型自动识别语言")
+        # 仅当 NFO/板块都判不出时，才用 whisper 自动检测
+        elif self._auto_detect_language:
+            logger.info("[特调] NFO/板块判不出语言 → 启用 whisper 自动检测")
             audio_lang = 'auto'
         elif not iso639.find(audio_lang) or not iso639.to_iso639_1(audio_lang):
             logger.info(f"字幕源偏好：{self._translate_preference} 未从音轨元数据中获取到语言信息")
@@ -810,9 +869,9 @@ class AutoSubv2AV(_PluginBase):
             _clip = 0
             if self._ad_skip_seconds and self._ad_skip_seconds > 0 and not self.__is_chinese_lang(audio_lang):
                 _clip = self._ad_skip_seconds
-                logger.info(f"[成人特调] 非中文片({audio_lang}) → 跳过开头 {_clip}s（避开中文广告）")
+                logger.info(f"[特调] 非中文片({audio_lang}) → 跳过开头 {_clip}s（避开中文广告）")
             else:
-                logger.info(f"[成人特调] 中文片({audio_lang}) 或未启用跳过 → 从头处理")
+                logger.info(f"[特调] 中文片({audio_lang}) 或未启用跳过 → 从头处理")
             ret, lang = self.__do_speech_recognition(audio_lang, audio_file.name, clip_start=_clip)
             if ret:
                 logger.info(f"生成字幕成功，原始语言：{lang}")
@@ -835,15 +894,24 @@ class AutoSubv2AV(_PluginBase):
             yield in_path
             return
 
+        # 特调：排除原盘后缀（交 675 处理，不做 ASR）
+        _disc_ext = {".iso", ".img", ".m2ts", ".vob"}
+        _exclude_extras = getattr(self, "_exclude_extras", False)
         for root, dirs, files in os.walk(in_path):
             if exclude_path and any(os.path.abspath(root).startswith(os.path.abspath(path))
                                     for path in exclude_path.split(",")):
                 continue
+            # 特调：排除 extras/extrafanart 目录
+            if _exclude_extras:
+                dirs[:] = [d for d in dirs if d.lower() not in ("extras", "extrafanart", "behind the scenes")]
 
             for file in files:
                 cur_path = os.path.join(root, file)
+                ext = os.path.splitext(file)[-1].lower()
+                if ext in _disc_ext:
+                    continue
                 # 检查后缀
-                if os.path.splitext(file)[-1].lower() in settings.RMT_MEDIAEXT:
+                if ext in settings.RMT_MEDIAEXT:
                     yield cur_path
 
     @staticmethod
@@ -1236,7 +1304,9 @@ class AutoSubv2AV(_PluginBase):
         :param video_file:
         :return:
         """
-        if self._translate_zh:
+        # ===== 特调：检查"中文字幕"是否存在（我们的产物是中文） =====
+        # （2026-09-19 修复：原逻辑按 translate_preference 检查日语，导致已有中文字幕的片不跳过）
+        if getattr(self, '_check_zh_subtitle', True) or self._translate_zh:
             prefer_langs = ['zh', 'chi', 'zh-CN', 'chs', 'zhs', 'zh-Hans', 'zhong', 'simp', 'cn']
             strict = True
         else:
@@ -1444,6 +1514,69 @@ class AutoSubv2AV(_PluginBase):
                                             'model': 'skip_nfo_chinese',
                                             'label': 'NFO有中文字幕则跳过',
                                             'color': 'primary'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'check_zh_subtitle',
+                                            'label': '已有中文字幕则跳过',
+                                            'color': 'primary'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'exclude_extras',
+                                            'label': '排除花絮目录(extras)',
+                                            'color': 'primary'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'timed_scrape',
+                                            'label': '定时全量扫描',
+                                            'hint': '定期扫描 path_list 里所有未处理的视频',
+                                            'color': 'primary'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'timed_interval_hours',
+                                            'label': '定时间隔(小时)',
+                                            'type': 'number',
+                                            'placeholder': '默认12小时'
                                         }
                                     }
                                 ]
@@ -1902,7 +2035,7 @@ class AutoSubv2AV(_PluginBase):
         ], {
             "enabled": False,
             "clear_history": False,
-            "send_notify": False,
+            "send_notify": True,
             "listen_transfer_event": True,
             "run_now": False,
             "path_list": "/vol2/1000/1024/霓虹\n/vol2/1000/1024/欧美\n/vol2/1000/1024/动漫\n/vol2/1000/1024/传媒\n/vol2/1000/1024/三级\n/vol2/1000/1024/韩国\n/vol2/1000/1024/探花",
@@ -1932,6 +2065,10 @@ class AutoSubv2AV(_PluginBase):
             "lang_source": "nfo_first",
             "ad_skip_seconds": 300,
             "skip_nfo_chinese": True,
+            "check_zh_subtitle": True,
+            "timed_scrape": False,
+            "timed_interval_hours": 12,
+            "exclude_extras": False,
         }
 
     def get_api(self) -> List[Dict[str, Any]]:
