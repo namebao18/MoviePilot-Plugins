@@ -685,7 +685,7 @@ class AutoSubv2AV(_PluginBase):
                 device="cpu", compute_type=self._compute_type, cpu_threads=self._cpu_threads)
             
             try:
-                # ===== 成人特调：跳过开头广告（clip_start>0 时）=====
+                # ===== 特调：clip_start>0 时跳过开头（仅"语言自动检测"场景用）=====
                 _ct = "0"
                 _vad = True
                 if clip_start and clip_start > 0:
@@ -886,13 +886,17 @@ class AutoSubv2AV(_PluginBase):
 
             # 生成字幕
             logger.info(f"开始生成字幕, 语言 {audio_lang} ...")
-            # ===== 成人特调：非中文片 → 跳过开头广告（中文片不跳）=====
+            # ===== 特调：跳开头仅用于"语言靠 whisper 自动检测"的场景 =====
+            # 用户澄清（2026-09-19）：NFO 已给出正确语言 → whisper 强制用该语言转写
+            # → 不需要语言检测 → 不需要跳开头 → 从头到尾全转（广告语音当内容噪音即可）
+            # 仅当 lang_source=auto（NFO/板块都判不出）时，才可能被开头广告带偏 → 才跳
             _clip = 0
-            if self._ad_skip_seconds and self._ad_skip_seconds > 0 and not self.__is_chinese_lang(audio_lang):
+            if (self._ad_skip_seconds and self._ad_skip_seconds > 0
+                    and (audio_lang == 'auto' or not audio_lang)):
                 _clip = self._ad_skip_seconds
-                logger.info(f"[特调] 非中文片({audio_lang}) → 跳过开头 {_clip}s（避开中文广告）")
+                logger.info(f"[特调] 语言靠自动检测 → 跳过开头 {_clip}s（避免广告带偏语言判定）")
             else:
-                logger.info(f"[特调] 中文片({audio_lang}) 或未启用跳过 → 从头处理")
+                logger.info(f"[特调] 语言已确定({audio_lang}) → 从头到尾全转（不跳开头）")
             ret, lang = self.__do_speech_recognition(audio_lang, audio_file.name, clip_start=_clip)
             if ret:
                 logger.info(f"生成字幕成功，原始语言：{lang}")
@@ -1516,7 +1520,7 @@ class AutoSubv2AV(_PluginBase):
                                             'model': 'ad_skip_seconds',
                                             'label': '广告跳过秒数',
                                             'type': 'number',
-                                            'placeholder': '非中文片跳过开头N秒（避开中文广告），默认300'
+                                            'placeholder': '仅语言自动检测时生效（避开开头广告带偏），默认300'
                                         }
                                     }
                                 ]
