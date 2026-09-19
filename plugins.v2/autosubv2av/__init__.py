@@ -505,13 +505,46 @@ class AutoSubv2AV(_PluginBase):
         """是否含日文假名（判定日语最可靠）"""
         return bool(re.search(r'[\u3040-\u30ff]', s or ''))
 
+    # 国产片商关键词（2026-09-19 v3）
+    _CN_STUDIOS = ('麻豆', '天美', '91', '蜜桃', '果冻', '星空', '精东', '国产', 'swag',
+                   '糖心', '乌鸦', '扣扣', '杏吧', '抖阴', '香蕉', '爱豆', '皇家')
+    # 欧美标签关键词
+    _EN_TAGS = ('caucasian', '欧美', '西洋', 'interracial', 'ebony', 'blacked',
+                'vixen', 'tushy', 'bangbus', 'amateur')
+
     def __detect_lang_from_nfo(self, video_file: str) -> str:
-        """从 NFO 判断语言，返回 iso639-1 代码或 ''（判不出）"""
+        """从 NFO 判断语言（v3，2026-09-19）。
+
+        ⚠️ 关键认知：
+          - `countrycode=JP` ≠ 日语（BANGBUS-BLAIRE IVORY 是欧美片但 cc=JP）
+          - `originaltitle` 也不可靠（FC2 系列被 JavDB 配了繁中标题，实际是日语片）
+          - 最可靠的是：**studio 片商** + **tags 标签**（Caucasian/国产）
+        """
         nfo = self.__read_nfo(video_file)
-        cc = nfo.get('countrycode', '')
-        studio = nfo.get('studio', '')
-        orig = nfo.get('originaltitle', '')
-        # 1) 国家代码
+        cc = (nfo.get('countrycode') or '').upper()
+        studio = nfo.get('studio') or ''
+        orig = nfo.get('originaltitle') or ''
+        tags = nfo.get('tags') or []
+        tags_l = [str(t).lower() for t in tags]
+
+        # 1) 国产片商 / 国产标签 → zh
+        if any(k in studio for k in self._CN_STUDIOS):
+            return 'zh'
+        if any('国产' in str(t) for t in tags):
+            return 'zh'
+        # 2) 欧美标签 → en（优先于 countrycode，因为 JavDB 会把欧美片标 JP）
+        if any(any(k in t for k in self._EN_TAGS) for t in tags_l):
+            return 'en'
+        # 3) 日文片商/标题（假名最可靠）→ ja
+        if self.__has_kana(studio) or self.__has_kana(orig):
+            return 'ja'
+        # 4) 纯英文标题（无 CJK）→ en
+        if orig and not self.__has_cjk(orig) and not re.search(r'[\uac00-\ud7af]', orig):
+            return 'en'
+        # 5) 韩文 → ko
+        if re.search(r'[\uac00-\ud7af]', studio) or re.search(r'[\uac00-\ud7af]', orig):
+            return 'ko'
+        # 6) countrycode 辅助
         if cc == 'JP':
             return 'ja'
         if cc == 'KR':
@@ -519,19 +552,10 @@ class AutoSubv2AV(_PluginBase):
         if cc in ('TW', 'CN', 'HK', 'MO'):
             return 'zh'
         if cc in ('US', 'GB', 'UK', 'CA', 'AU', 'FR', 'DE', 'ES', 'IT', 'RU', 'BR'):
-            return 'en' if cc in ('US', 'GB', 'UK', 'CA', 'AU') else 'en'
-        # 2) 无国家代码 → 看 studio / originaltitle
-        if self.__has_kana(studio) or self.__has_kana(orig):
-            return 'ja'
-        # 韩文
-        if re.search(r'[\uac00-\ud7af]', studio or '') or re.search(r'[\uac00-\ud7af]', orig or ''):
-            return 'ko'
-        # 纯中文（且无假名）→ 可能是中文片，但也可能是繁中翻译标题，交给板块兜底
-        if self.__has_cjk(orig) and not self.__has_kana(orig):
-            return 'zh'
-        # 纯英文
-        if orig and not self.__has_cjk(orig):
             return 'en'
+        # 7) 纯中文标题 → zh
+        if self.__has_cjk(orig):
+            return 'zh'
         return ''
 
     def __board_lang(self, video_file: str) -> str:
