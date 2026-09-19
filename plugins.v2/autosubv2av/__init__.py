@@ -685,18 +685,15 @@ class AutoSubv2AV(_PluginBase):
                 device="cpu", compute_type=self._compute_type, cpu_threads=self._cpu_threads)
             
             try:
-                # ===== 特调：clip_start>0 时跳过开头（仅"语言自动检测"场景用）=====
-                _ct = "0"
-                _vad = True
-                if clip_start and clip_start > 0:
-                    _ct = str(int(clip_start))
-                    _vad = False  # clip_timestamps 与 vad_filter 互斥
-                    logger.info(f"[特调] 使用 clip_timestamps={_ct} 跳过开头（避开中文广告）")
+                # ===== 特调：始终从头处理 + 多段语言检测（不损失内容）=====
+                # 语言自动检测时，用 5 段音频投票（避免被开头广告单段带偏）
+                _lds = 5 if (lang == 'auto' or not lang) else 1
                 segments, info = model.transcribe(audio_file,
                                                   language=lang if lang != 'auto' else None,
                                                   word_timestamps=True,
-                                                  vad_filter=_vad,
-                                                  clip_timestamps=_ct,
+                                                  vad_filter=True,
+                                                  clip_timestamps="0",
+                                                  language_detection_segments=_lds,
                                                   temperature=0,
                                                   beam_size=5)
                 logger.info("Detected language '%s' with probability %f" % (info.language, info.language_probability))
@@ -886,18 +883,15 @@ class AutoSubv2AV(_PluginBase):
 
             # 生成字幕
             logger.info(f"开始生成字幕, 语言 {audio_lang} ...")
-            # ===== 特调：跳开头仅用于"语言靠 whisper 自动检测"的场景 =====
-            # 用户澄清（2026-09-19）：NFO 已给出正确语言 → whisper 强制用该语言转写
-            # → 不需要语言检测 → 不需要跳开头 → 从头到尾全转（广告语音当内容噪音即可）
-            # 仅当 lang_source=auto（NFO/板块都判不出）时，才可能被开头广告带偏 → 才跳
-            _clip = 0
-            if (self._ad_skip_seconds and self._ad_skip_seconds > 0
-                    and (audio_lang == 'auto' or not audio_lang)):
-                _clip = self._ad_skip_seconds
-                logger.info(f"[特调] 语言靠自动检测 → 跳过开头 {_clip}s（避免广告带偏语言判定）")
+            # ===== 特调：始终从头到尾全转（不跳开头）=====
+            # 用户澄清（2026-09-19）：没有 NFO 的片也要整片转写，广告当噪音
+            # "检测语言"与"转写"是两件事 —— 不能因为检测而损失转写内容
+            # 避免广告带偏语言的方法：增大 language_detection_segments（多段投票），而非跳开头
+            if audio_lang == 'auto' or not audio_lang:
+                logger.info("[特调] 语言靠自动检测 → 多段投票（language_detection_segments=5），从头全转")
             else:
-                logger.info(f"[特调] 语言已确定({audio_lang}) → 从头到尾全转（不跳开头）")
-            ret, lang = self.__do_speech_recognition(audio_lang, audio_file.name, clip_start=_clip)
+                logger.info(f"[特调] 语言已确定({audio_lang}) → 从头到尾全转")
+            ret, lang = self.__do_speech_recognition(audio_lang, audio_file.name, clip_start=0)
             if ret:
                 logger.info(f"生成字幕成功，原始语言：{lang}")
                 # 复制字幕文件
@@ -1520,7 +1514,7 @@ class AutoSubv2AV(_PluginBase):
                                             'model': 'ad_skip_seconds',
                                             'label': '广告跳过秒数',
                                             'type': 'number',
-                                            'placeholder': '仅语言自动检测时生效（避开开头广告带偏），默认300'
+                                            'placeholder': '已废弃（改用多段语言检测，不再跳开头）'
                                         }
                                     }
                                 ]
