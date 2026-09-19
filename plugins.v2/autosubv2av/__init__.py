@@ -133,6 +133,7 @@ class AutoSubv2AV(_PluginBase):
     _ZH_LANGS = ('zh', 'chi', 'zho', 'zh-cn', 'zhs', 'zh-hans', 'chs', 'cn', 'zh-tw', 'cht', 'zh-hant')
 
     _timed_thread = None            # 定时线程（2026-09-19）
+    _timed_stop = None              # 定时线程停止标志（2026-09-19）
 
     # 语言偏好映射：选项值 -> (语言代码列表, 严格匹配)
     _LANG_MAP = {
@@ -149,6 +150,8 @@ class AutoSubv2AV(_PluginBase):
         # 如果没有配置信息， 则不处理
         if not config:
             return
+        # 特调：先停掉旧的定时线程（避免配置变更时线程叠加，2026-09-19）
+        self.__stop_timed_scrape()
         self._tasks = self.load_tasks()
         self._enabled = config.get('enabled', False)
         self._clear_history = config.get('clear_history', False)
@@ -399,42 +402,60 @@ class AutoSubv2AV(_PluginBase):
                 logger.warn(f"目录/文件无效，不进行处理:{path}")
                 continue
             if os.path.isdir(path):
-                for video_file in self.__get_library_files(path):
+                for video_file in self.__get_library_files(
+                        path, exclude_extras=self._exclude_extras):
                     self.add_task(video_file, TaskSource.MANUAL)
             elif os.path.splitext(path)[-1].lower() in settings.RMT_MEDIAEXT:
                 self.add_task(path, TaskSource.MANUAL)
+
+    def __stop_timed_scrape(self):
+        """特调：停止定时线程（2026-09-19）"""
+        if self._timed_stop is not None:
+            self._timed_stop.set()
+        if self._timed_thread and self._timed_thread.is_alive():
+            self._timed_thread.join(timeout=5)
+            logger.info("[特调] 已停止旧的定时扫描线程")
+        self._timed_thread = None
+        self._timed_stop = None
 
     def __start_timed_scrape(self):
         """特调：启动内置定时全量扫描（2026-09-19 新增，类似 mdcx 的 timed_scrape）"""
         if self._timed_thread and self._timed_thread.is_alive():
             return
+        self._timed_stop = threading.Event()
         interval_h = self._timed_interval_hours or 12.0
         logger.info(f"[特调] 已启用内置定时全量扫描，间隔 {interval_h} 小时")
 
-        def _loop():
-            # 首次延迟 5 分钟启动（避开 MP 启动期）
-            time.sleep(300)
-            while not self._event.is_set():
-                try:
-                    logger.info("[特调] 定时全量扫描开始")
-                    # 重新读 path_list（用配置里的）
-                    cfg = self.get_config() or {}
-                    pl = cfg.get('path_list') or ''
-                    paths = [x.strip() for x in pl.replace('\r', '').split('\n') if x.strip()]
-                    if paths:
-                        self._run_at_once(path_list=paths)
-                    else:
-                        logger.warning("[特调] path_list 为空，跳过定时扫描")
-                except Exception as e:
-                    logger.error(f"[特调] 定时扫描异常: {e}")
-                # 等待间隔
-                for _ in range(int(interval_h * 3600)):
-                    if self._event.is_set():
-                        break
-                    time.sleep(1)
-
-        self._timed_thread = threading.Thread(target=_loop, daemon=True)
+        # 注意：不用嵌套闭包（MP 运行时下 self 可能不可用）
+        # → 改成绑定实例方法的类函数
+        self._timed_thread = threading.Thread(
+            target=self.__timed_loop, args=(interval_h,), daemon=True)
         self._timed_thread.start()
+
+    def __timed_loop(self, interval_h):
+        """定时循环（独立方法，避免闭包 self 问题）"""
+        # 首次延迟 5 分钟启动（避开 MP 启动期）
+        for _ in range(300):
+            if self._timed_stop and self._timed_stop.is_set():
+                return
+            time.sleep(1)
+        while not (self._event.is_set() or (self._timed_stop and self._timed_stop.is_set())):
+            try:
+                logger.info("[特调] 定时全量扫描开始")
+                cfg = self.get_config() or {}
+                pl = cfg.get('path_list') or ''
+                paths = [x.strip() for x in pl.replace('\r', '').split('\n') if x.strip()]
+                if paths:
+                    self._run_at_once(path_list=paths)
+                else:
+                    logger.warning("[特调] path_list 为空，跳过定时扫描")
+            except Exception as e:
+                logger.error(f"[特调] 定时扫描异常: {e}")
+            # 等待间隔
+            for _ in range(int(interval_h * 3600)):
+                if self._event.is_set() or (self._timed_stop and self._timed_stop.is_set()):
+                    break
+                time.sleep(1)
 
     def __check_asr(self):
         if not self._faster_whisper_model_path or not self._faster_whisper_model:
@@ -886,9 +907,10 @@ class AutoSubv2AV(_PluginBase):
                 return False, None, None
 
     @staticmethod
-    def __get_library_files(in_path, exclude_path=None):
+    def __get_library_files(in_path, exclude_path=None, exclude_extras=False):
         """
         获取目录媒体文件列表
+        :param exclude_extras: 是否排除 extras/extrafanart 目录（2026-09-19）
         """
         if not os.path.isdir(in_path):
             yield in_path
@@ -896,7 +918,7 @@ class AutoSubv2AV(_PluginBase):
 
         # 特调：排除原盘后缀（交 675 处理，不做 ASR）
         _disc_ext = {".iso", ".img", ".m2ts", ".vob"}
-        _exclude_extras = getattr(self, "_exclude_extras", False)
+        _exclude_extras = exclude_extras
         for root, dirs, files in os.walk(in_path):
             if exclude_path and any(os.path.abspath(root).startswith(os.path.abspath(path))
                                     for path in exclude_path.split(",")):
