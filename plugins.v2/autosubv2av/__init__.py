@@ -87,19 +87,11 @@ class AutoSubv2AV(_PluginBase):
     _event = Event()
     _enabled = None
     _clear_history = None
-    _listen_transfer_event = None
-    _send_notify = None
     _translate_preference = None
     _run_now = None
     _path_list = None
     _file_size = None
     _need_translate = None
-    _openai = None
-    _enable_batch = None
-    _batch_size = None
-    _context_window = None
-    _max_retries = None
-    _enable_merge = None
     _enable_asr = None
     _auto_detect_language = None
     _huggingface_proxy = None
@@ -111,7 +103,6 @@ class AutoSubv2AV(_PluginBase):
     _board_filter = None            # 板块过滤（空=全部）
     _lang_source = None             # 语言来源: nfo_first / board / auto
     _board_lang_map = None          # 板块语言映射（dict）
-    _ad_skip_seconds = None         # 广告跳过秒数（仅非中文片）
     _skip_nfo_chinese = None        # NFO 有中文字幕标签则跳过
     _check_zh_subtitle = None       # 检查已有中文字幕则跳过（2026-09-19 新增）
     _timed_scrape = None            # 内置定时全量扫描（2026-09-19 新增）
@@ -155,11 +146,11 @@ class AutoSubv2AV(_PluginBase):
         self._tasks = self.load_tasks()
         self._enabled = config.get('enabled', False)
         self._clear_history = config.get('clear_history', False)
-        self._listen_transfer_event = config.get('listen_transfer_event', True)
+        self._listen_transfer_event = False  # 已废弃：成人库不经 MP 整理，事件不触发
         self._run_now = config.get('run_now')
         if self._run_now:
             self._path_list = list(set(config.get('path_list').split('\n')))
-        self._send_notify = config.get('send_notify', False)
+        self._send_notify = False  # 已废弃：用户要求静默识别
         self._file_size = int(config.get('file_size')) if config.get('file_size') else 10
         # 字幕生成设置
         self._translate_preference = config.get('translate_preference', 'english_first')
@@ -205,41 +196,7 @@ class AutoSubv2AV(_PluginBase):
         except Exception:
             self._timed_interval_hours = 12.0
         self._exclude_extras = config.get('exclude_extras', False)
-        self._translate_zh = config.get('translate_zh', False)
-        if self._translate_zh:
-            use_chatgpt = config.get('use_chatgpt', True)
-            if use_chatgpt:
-                chatgpt = self.get_config("ChatGPT")
-                if not chatgpt:
-                    logger.error(f"翻译依赖于ChatGPT，请先维护ChatGPT插件")
-                    return
-                openai_key_str = chatgpt and chatgpt.get("openai_key")
-                openai_url = chatgpt and chatgpt.get("openai_url")
-                openai_proxy = chatgpt and chatgpt.get("proxy")
-                openai_model = chatgpt and chatgpt.get("model")
-                compatible = chatgpt and chatgpt.get("compatible")
-                if not openai_key_str:
-                    logger.error(f"请先在ChatGPT插件中维护openai_key")
-                    return
-                openai_key = [key.strip() for key in openai_key_str.split(',') if key.strip()][0]
-            else:
-                openai_key = config.get('openai_key')
-                if not openai_key:
-                    logger.error(f"翻译依赖于OpenAI，请先维护openai_key")
-                    return
-                openai_url = config.get('openai_url', "https://api.openai.com")
-                openai_proxy = config.get('openai_proxy', False)
-                openai_model = config.get('openai_model', "gpt-3.5-turbo")
-                compatible = config.get('compatible', False)
-            self._openai = OpenAi(api_key=openai_key, api_url=openai_url,
-                                  proxy=settings.PROXY if openai_proxy else None,
-                                  model=openai_model, compatible=bool(compatible))
-            self._enable_batch = config.get('enable_batch', True)
-            self._batch_size = int(config.get('batch_size')) if config.get('batch_size') else 10
-            self._context_window = int(config.get('context_window')) if config.get('context_window') else 5
-            self._max_retries = int(config.get('max_retries')) if config.get('max_retries') else 3
-            self._enable_merge = config.get('enable_merge', False)
-
+        self._translate_zh = False  # 已废弃：翻译走青龙640脚本
         if self._clear_history:
             config['clear_history'] = False
             self.update_config(config)
@@ -633,16 +590,8 @@ class AutoSubv2AV(_PluginBase):
                     self.post_message(mtype=NotificationType.Plugin, title="【自动字幕生成】", text=message)
                 return TaskStatus.FAILED
 
-            if self._translate_zh:
-                # 翻译字幕
-                logger.info(f"开始翻译字幕为中文 ...")
-                self.__translate_zh_subtitle(lang, gen_sub_path, f"{file_path}.zh.机翻.srt")
-                logger.info(f"翻译字幕完成：{file_name}.zh.机翻.srt")
-
             end_time = time.time()
             message = f" 媒体: {file_name}\n 处理完成\n 字幕原始语言: {lang}\n "
-            if self._translate_zh:
-                message += f"字幕翻译语言: zh\n "
             message += f"耗时：{round(end_time - start_time, 2)}秒"
             logger.info(f"自动字幕生成 处理完成：{message}")
             if self._send_notify:
@@ -1120,121 +1069,7 @@ class AutoSubv2AV(_PluginBase):
         return True, subtitle_index, subtitle_lang
 
     @staticmethod
-    def __is_noisy_subtitle(content):
-        """
-        判断是否为背景音等字幕
-        :param content:
-        :return:
-        """
-        noisy_tokens = [('(', ')'), ('[', ']'), ('{', '}'), ('【', '】'), ('♪', '♪'), ('♫', '♫'), ('♪♪', '♪♪')]
-        return any(content.startswith(t[0]) and content.endswith(t[1]) for t in noisy_tokens)
 
-    def __get_context(self, all_subs: list, target_indices: List[int], is_batch: bool) -> str:
-        """通用上下文获取方法"""
-        min_idx = max(0, min(target_indices) - self._context_window)
-        max_idx = min(len(all_subs) - 1, max(target_indices) + self._context_window) if is_batch else min(
-            target_indices)
-
-        context = []
-        for idx in range(min_idx, max_idx + 1):
-            status = "[待译]" if idx in target_indices else ""
-            content = all_subs[idx].content.replace('\n', ' ').strip()
-            context.append(f"{status}{content}")
-
-        return "\n".join(context)
-
-    def __process_items(self, all_subs: list, items: list) -> list:
-        """统一处理入口（支持批量和单条）"""
-        if self._enable_batch and len(items) > 1:
-            return self.__process_batch(all_subs, items)
-        return [self.__process_single(all_subs, item) for item in items]
-
-    def __translate_to_zh(self, text: str, context: str = None) -> str:
-        if self._event.is_set():
-            raise UserInterruptException("用户中断当前任务")
-        return self._openai.translate_to_zh(text, context, max_retries=self._max_retries)
-
-    def __process_batch(self, all_subs: list, batch: list) -> list:
-        """批量处理逻辑"""
-        indices = [all_subs.index(item) for item in batch]
-        context = self.__get_context(all_subs, indices, is_batch=True) if self._context_window > 0 else None
-        batch_text = '\n'.join([item.content for item in batch])
-
-        try:
-            ret, result = self.__translate_to_zh(batch_text, context)
-            if not ret:
-                raise Exception(result)
-
-            translated = [line.strip() for line in result.split('\n') if line.strip()]
-            if len(translated) != len(batch):
-                raise Exception(f"批次行数不匹配 {len(translated)}/{len(batch)}")
-
-            for item, trans in zip(batch, translated):
-                item.content = f"{trans}\n{item.content}"
-            self._stats['batch_success'] += len(batch)
-            return batch
-        except Exception as e:
-            logger.warning(f"批次翻译失败（{str(e)}），降级到单行匹配...")
-            self._stats['batch_fail'] += 1
-            return [self.__process_single(all_subs, item) for item in batch]
-
-    def __process_single(self, all_subs: List[srt.Subtitle], item: srt.Subtitle) -> srt.Subtitle:
-        """单条处理逻辑"""
-        idx = all_subs.index(item)
-        context = self.__get_context(all_subs, [idx], is_batch=False) if self._context_window > 0 else None
-        success, trans = self.__translate_to_zh(item.content, context)
-
-        if success:
-            item.content = f"{trans}\n{item.content}"
-            self._stats['line_fallback'] += 1
-            return item
-        else:
-            item.content = f"[翻译失败]\n{item.content}"
-            return item
-
-    def __translate_zh_subtitle(self, source_lang: str, source_subtitle: str, dest_subtitle: str):
-        self._stats = {'total': 0, 'batch_success': 0, 'batch_fail': 0, 'line_fallback': 0}
-        subs = self.__load_srt(source_subtitle)
-        if source_lang in ["en", "eng"] and self._enable_merge:
-            valid_subs = self.__merge_srt(subs)
-            logger.info(f"英文字幕合并：合并前字幕数: {len(subs)},合并后字幕数: {len(valid_subs)}")
-        else:
-            valid_subs = subs
-        
-        if not valid_subs:
-            logger.warning("字幕文件为空或没有有效的字幕条目，跳过翻译")
-            # 创建一个空的字幕文件
-            self.__save_srt(dest_subtitle, [])
-            return
-            
-        self._stats['total'] = len(valid_subs)
-        processed = []
-        current_batch = []
-
-        for item in valid_subs:
-            current_batch.append(item)
-
-            if len(current_batch) >= self._batch_size:
-                processed += self.__process_items(valid_subs, current_batch)
-                current_batch = []
-                logger.info(f"进度: {len(processed)}/{len(valid_subs)}")
-
-        if current_batch:
-            processed += self.__process_items(valid_subs, current_batch)
-
-        self.__save_srt(dest_subtitle, processed)
-        
-        success_rate = (self._stats['batch_success'] / self._stats['total'] * 100) if self._stats['total'] > 0 else 0.0
-        
-        logger.info(f"""
-    翻译完成！
-    总处理条目: {self._stats['total']}
-    批次成功: {self._stats['batch_success']} ({success_rate:.1f}%)
-    批次失败: {self._stats['batch_fail']}
-    行补偿翻译: {self._stats['line_fallback']}
-            """)
-
-    @staticmethod
     def __external_subtitle_exists(video_file, prefer_langs=None, only_srt=False, strict=True):
         """
         外部字幕文件是否存在,支持多种格式及扩展需求。
@@ -1400,38 +1235,11 @@ class AutoSubv2AV(_PluginBase):
                                     }
                                 ]
                             },
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 4},
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'send_notify',
-                                            'label': '发送通知'
-                                        }
-                                    }
-                                ]
-                            }
                         ]
                     },
                     {
                         'component': 'VRow',
                         'content': [
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 4},
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'listen_transfer_event',
-                                            'label': '媒体入库自动执行',
-                                            'hint': '监听媒体入库事件，自动执行字幕生成'
-                                        }
-                                    }
-                                ]
-                            },
                             {
                                 'component': 'VCol',
                                 'props': {'cols': 12, 'md': 4},
@@ -1500,21 +1308,6 @@ class AutoSubv2AV(_PluginBase):
                                                 {'title': '按板块', 'value': 'board'},
                                                 {'title': 'whisper自动检测', 'value': 'auto'},
                                             ]
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 4},
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'ad_skip_seconds',
-                                            'label': '广告跳过秒数',
-                                            'type': 'number',
-                                            'placeholder': '已废弃（改用多段语言检测，不再跳开头）'
                                         }
                                     }
                                 ]
@@ -1660,20 +1453,6 @@ class AutoSubv2AV(_PluginBase):
                                     }
                                 ]
                             },
-                            {
-                                'component': 'VCol',
-                                'props': {'cols': 12, 'md': 4},
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'translate_zh',
-                                            'label': '翻译成中文',
-                                            'hint': '使用大模型翻译成中文字幕'
-                                        }
-                                    }
-                                ]
-                            }
                         ]
                     },
                     {
@@ -1796,19 +1575,7 @@ class AutoSubv2AV(_PluginBase):
                                             {
                                                 'component': 'VRow',
                                                 'content': [
-                                                    {
-                                                        'component': 'VCol',
-                                                        'props': {'cols': 12, 'md': 4},
-                                                        'content': [
-                                                            {
-                                                                'component': 'VSwitch',
-                                                                'props': {
-                                                                    'model': 'use_chatgpt',
-                                                                    'label': '复用ChatGPT插件配置'
-                                                                }
-                                                            }
-                                                        ]
-                                                    },
+                                                    
                                                     {
                                                         'component': 'VTextField',
                                                         'props': {
@@ -1817,101 +1584,16 @@ class AutoSubv2AV(_PluginBase):
                                                             'text': 'trigger',
                                                             'change': 'use_chatgpt_trigger = use_chatgpt ? 1 : 0'
                                                         }
-                                                    },
-                                                    {
-                                                        'component': 'VCol',
-                                                        'props': {
-                                                            'cols': 12,
-                                                            'md': 4,
-                                                        },
-                                                        'content': [
-                                                            {
-                                                                'component': 'VSwitch',
-                                                                'props': {
-                                                                    'model': 'openai_proxy',
-                                                                    'label': '使用代理服务器',
-                                                                    'v-show': '!use_chatgpt',
-                                                                    'v-if': '!use_chatgpt'
-                                                                }
-                                                            }
-                                                        ]
-                                                    },
-                                                    {
-                                                        'component': 'VCol',
-                                                        'props': {
-                                                            'cols': 12,
-                                                            'md': 4,
-                                                        },
-                                                        'content': [
-                                                            {
-                                                                'component': 'VSwitch',
-                                                                'props': {
-                                                                    'model': 'compatible',
-                                                                    'label': '兼容模式',
-                                                                    'v-show': '!use_chatgpt'
-                                                                }
-                                                            }
-                                                        ]
                                                     }
+                                                    
                                                 ]
                                             },
                                             {
                                                 'component': 'VRow',
                                                 'content': [
-                                                    {
-                                                        'component': 'VCol',
-                                                        'props': {
-                                                            'cols': 12,
-                                                            'md': 4
-                                                        },
-                                                        'content': [
-                                                            {
-                                                                'component': 'VTextField',
-                                                                'props': {
-                                                                    'model': 'openai_url',
-                                                                    'label': 'OpenAI API Url',
-                                                                    'placeholder': 'https://api.openai.com',
-                                                                    'v-show': '!use_chatgpt'
-                                                                }
-                                                            }
-                                                        ]
-                                                    },
-                                                    {
-                                                        'component': 'VCol',
-                                                        'props': {
-                                                            'cols': 12,
-                                                            'md': 4
-                                                        },
-                                                        'content': [
-                                                            {
-                                                                'component': 'VTextField',
-                                                                'props': {
-                                                                    'model': 'openai_key',
-                                                                    'label': 'API密钥',
-                                                                    'placeholder': 'sk-xxx',
-                                                                    'v-show': '!use_chatgpt'
-                                                                }
-                                                            }
-                                                        ]
-                                                    },
-                                                    {
-                                                        'component': 'VCol',
-                                                        'props': {
-                                                            'cols': 12,
-                                                            'md': 4
-                                                        },
-                                                        'content': [
-                                                            {
-                                                                'component': 'VTextField',
-                                                                'props': {
-                                                                    'model': 'openai_model',
-                                                                    'label': '自定义模型',
-                                                                    'placeholder': 'gpt-3.5-turbo',
-                                                                    'v-show': '!use_chatgpt'
-                                                                }
-                                                            }
-                                                        ]
-                                                    }
+                                                    
+                                                    
+                                                    
                                                 ]
                                             }
                                         ]
@@ -1932,79 +1614,16 @@ class AutoSubv2AV(_PluginBase):
                                             {
                                                 'component': 'VRow',
                                                 'content': [
-                                                    {
-                                                        'component': 'VCol',
-                                                        'props': {'cols': 12, 'md': 4},
-                                                        'content': [
-                                                            {
-                                                                'component': 'VTextField',
-                                                                'props': {
-                                                                    'model': 'context_window',
-                                                                    'label': '上下文窗口大小',
-                                                                    'placeholder': '5'
-                                                                }
-                                                            }
-                                                        ]
-                                                    },
-                                                    {
-                                                        'component': 'VCol',
-                                                        'props': {'cols': 12, 'md': 4},
-                                                        'content': [
-                                                            {
-                                                                'component': 'VTextField',
-                                                                'props': {
-                                                                    'model': 'max_retries',
-                                                                    'label': 'llm请求重试次数',
-                                                                    'placeholder': '3'
-                                                                }
-                                                            }
-                                                        ]
-                                                    },
-                                                    {
-                                                        'component': 'VCol',
-                                                        'props': {'cols': 12, 'md': 4},
-                                                        'content': [
-                                                            {
-                                                                'component': 'VSwitch',
-                                                                'props': {
-                                                                    'model': 'enable_merge',
-                                                                    'label': '翻译英文时合并整句'
-                                                                }
-                                                            }
-                                                        ]
-                                                    }
+                                                    
+                                                    
+                                                    
                                                 ]
                                             },
                                             {
                                                 'component': 'VRow',
                                                 'content': [
-                                                    {
-                                                        'component': 'VCol',
-                                                        'props': {'cols': 12, 'md': 4},
-                                                        'content': [
-                                                            {
-                                                                'component': 'VSwitch',
-                                                                'props': {
-                                                                    'model': 'enable_batch',
-                                                                    'label': '启用批量翻译'
-                                                                }
-                                                            }
-                                                        ]
-                                                    },
-                                                    {
-                                                        'component': 'VCol',
-                                                        'props': {'cols': 12, 'md': 4, 'v-show': 'enable_batch'},
-                                                        'content': [
-                                                            {
-                                                                'component': 'VTextField',
-                                                                'props': {
-                                                                    'model': 'batch_size',
-                                                                    'label': '每批翻译行数',
-                                                                    'placeholder': '10'
-                                                                }
-                                                            }
-                                                        ]
-                                                    }
+                                                    
+                                                    
                                                 ]
                                             }
                                         ]
@@ -2055,35 +1674,19 @@ class AutoSubv2AV(_PluginBase):
         ], {
             "enabled": False,
             "clear_history": False,
-            "send_notify": True,
-            "listen_transfer_event": True,
             "run_now": False,
             "path_list": "/vol2/1000/1024/霓虹\n/vol2/1000/1024/欧美\n/vol2/1000/1024/动漫\n/vol2/1000/1024/传媒\n/vol2/1000/1024/三级\n/vol2/1000/1024/韩国\n/vol2/1000/1024/探花",
             "file_size": "5",
             "translate_preference": "lang_ja",
             "custom_language": "",
-            "translate_zh": False,
             "enable_asr": True,
             "auto_detect_language": False,
             "faster_whisper_model": "large-v3",
             "cpu_threads": 2,
             "compute_type": "float32",
             "proxy": True,
-            "use_chatgpt": True,
-            "use_chatgpt_trigger": 0,
-            "openai_proxy": False,
-            "compatible": False,
-            "openai_url": "https://api.openai.com",
-            "openai_key": None,
-            "openai_model": "gpt-3.5-turbo",
-            "context_window": 5,
-            "max_retries": 3,
-            "enable_merge": False,
-            "enable_batch": True,
-            "batch_size": 10,
             "board_filter": "",
             "lang_source": "nfo_first",
-            "ad_skip_seconds": 300,
             "skip_nfo_chinese": True,
             "check_zh_subtitle": True,
             "timed_scrape": False,
