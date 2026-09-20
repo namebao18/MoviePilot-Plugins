@@ -70,7 +70,7 @@ class AutoSubv2AV(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.4"
+    plugin_version = "1.0.5"
     # 插件作者
     plugin_author = "TimoYoung (AV modified)"
     # 作者主页
@@ -704,11 +704,30 @@ class AutoSubv2AV(_PluginBase):
             if not os.path.exists(cache_dir):
                 os.mkdir(cache_dir)
             os.environ["HF_HUB_CACHE"] = cache_dir
-            if self._huggingface_proxy:
-                os.environ["HTTP_PROXY"] = settings.PROXY['http']
-                os.environ["HTTPS_PROXY"] = settings.PROXY['https']
+            # ===== 本地改造（2026-09-20）：修复"代理污染全局环境"bug =====
+            # 旧代码直接 os.environ["HTTP_PROXY"]=... 且从不清理，
+            # 导致 whisper 下载一次模型后，MP 主进程内所有 requests 请求
+            # （含 qB 下载器、站点请求）全部被强制走旁路由代理，
+            # 代理不稳定时报 "添加下载任务失败 / disk I/O error"。
+            # 现改为：仅在 download_model 调用期间临时设置，用 finally 无条件恢复。
+            _proxy_keys = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
+            _saved_proxy = {k: os.environ.get(k) for k in _proxy_keys}
+            if self._huggingface_proxy and settings.PROXY:
+                os.environ["HTTP_PROXY"] = settings.PROXY.get('http', '')
+                os.environ["HTTPS_PROXY"] = settings.PROXY.get('https', '')
+                os.environ["http_proxy"] = settings.PROXY.get('http', '')
+                os.environ["https_proxy"] = settings.PROXY.get('https', '')
+            try:
+                _model_path = download_model(self._faster_whisper_model, local_files_only=False, cache_dir=cache_dir)
+            finally:
+                # 无论下载成败，都必须把环境恢复原样（原值可能不存在 → 删除）
+                for _k in _proxy_keys:
+                    if _saved_proxy[_k] is None:
+                        os.environ.pop(_k, None)
+                    else:
+                        os.environ[_k] = _saved_proxy[_k]
             model = WhisperModel(
-                download_model(self._faster_whisper_model, local_files_only=False, cache_dir=cache_dir),
+                _model_path,
                 device="cpu", compute_type=self._compute_type, cpu_threads=self._cpu_threads)
             
             try:
