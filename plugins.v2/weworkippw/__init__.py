@@ -101,9 +101,16 @@ class WeWorkIPPW(_PluginBase):
     #       同一失败周期内只在首轮发通知；连续失败达上限则暂停自动登录，改为手动触发。
     _login_fail_count = 0          # 当前连续登录失败次数
     _login_cycle_notified = False  # 本次失败周期是否已发过通知（降噪用）
-    # 退避阶梯（秒）：第 1~5 次失败依次等待，之后封顶 30 分钟
-    _login_backoff_steps = [60, 300, 900, 1800]
+    # 退避阶梯（秒）：首次失败后 5s 快速重试一次，之后 1m/5m/15m/30m 递增，封顶 30 分钟
+    _login_backoff_steps = [5, 60, 300, 900, 1800]
     _login_max_retry = 10          # 连续失败达此数则暂停自动登录
+    # 本地改造（2026-09-20）：登录是否正在执行中。
+    # ⚠️ 不能靠 wwlogin job 是否存在判断——APScheduler 的 date job 一旦开始执行就会被移除，
+    #    导致 refresh_cookie（每5分钟）误判"没有登录任务"而重复触发登录。
+    _login_running = False
+    # 本地改造（2026-09-20）：插件停止标志。stop_service 时置 True，
+    # login() 的等待循环据此提前退出，避免 stop_service 的 scheduler.shutdown() 被长时间阻塞。
+    _stop_flag = False
     _driver = None
     _refresh_lock = threading.Lock()
     # 定时器
@@ -123,6 +130,7 @@ class WeWorkIPPW(_PluginBase):
         # 本地改造（2026-09-20）：重置登录失败退避状态（类属性不随实例重置，需显式清零）
         self._reset_login_backoff()
         self._clear_code_input_session()
+        self._stop_flag = False
         if config:
             self._enabled = config.get("enabled")
             self._check_cron = config.get("cron")
@@ -328,11 +336,15 @@ class WeWorkIPPW(_PluginBase):
             logger.error(f"更改可信IP失败:{e}")
     
     def refresh_cookie(self,_login=True):
+        # 本地改造（2026-09-20）：定时刷新（_login=True）时若登录流程正在执行，直接跳过，
+        # 避免与登录的 Playwright 实例冲突/抢资源（login 内部以 _login=False 调用，不受此限）
+        if _login and self._login_running:
+            logger.info("登录流程正在执行，跳过本次定时刷新")
+            return
         if not self._refresh_lock.acquire(blocking=False):
             logger.info("另一个刷新任务正在运行，跳过")
             return
         try:
-            logger.info("另一个刷新任务正在运行，跳过")
             if not self.check_connect():
                 logger.error("网络连接失败,请检查网络配置")
                 return
@@ -344,12 +356,15 @@ class WeWorkIPPW(_PluginBase):
                     logger.error('cookie为空,请检查CC配置和插件手动填写项')
                     browser.close()
                     self._cookie_valid = False
-                    # 本地改造（2026-09-20）：已暂停自动登录（连续失败达上限）则不再自动重登
-                    if self._schedule_login and self._login_fail_count < self._login_max_retry:
-                        if self._scheduler.get_job("refresh_cookie"):
-                            self._scheduler.remove_job("refresh_cookie")
-                        if not self._scheduler.get_job("wwlogin") and _login:
-                            self.create_login_job()
+                    # 本地改造（2026-09-20）：已暂停自动登录（连续失败达上限）则不再自动重登；
+                    # 否则仅在「当前没有登录正在执行/排队」时按退避延迟触发一次
+                    # （靠 _login_running 标志 + wwlogin job id 双重去重）
+                    if (self._schedule_login
+                            and self._login_fail_count < self._login_max_retry
+                            and _login
+                            and not self._login_running
+                            and not self._scheduler.get_job("wwlogin")):
+                        self.create_login_job(delay=self._next_login_delay())
                     return
                 context.add_cookies(cookie)
                 page = context.new_page()
@@ -360,12 +375,13 @@ class WeWorkIPPW(_PluginBase):
                 if login.is_visible():
                     logger.info("cookie失效,请重新获取")
                     self._cookie_valid = False
-                    # 本地改造（2026-09-20）：已暂停自动登录则不再自动重登
-                    if self._schedule_login and self._login_fail_count < self._login_max_retry:
-                        if self._scheduler.get_job("refresh_cookie"):
-                            self._scheduler.remove_job("refresh_cookie")
-                        if not self._scheduler.get_job("wwlogin") and _login:
-                            self.create_login_job()
+                    # 本地改造（2026-09-20）：同上，按退避延迟触发且不重复
+                    if (self._schedule_login
+                            and self._login_fail_count < self._login_max_retry
+                            and _login
+                            and not self._login_running
+                            and not self._scheduler.get_job("wwlogin")):
+                        self.create_login_job(delay=self._next_login_delay())
                     else:
                         pass
                 else:
@@ -373,6 +389,10 @@ class WeWorkIPPW(_PluginBase):
                     self._cookie_valid = True
                     # 本地改造（2026-09-20）：cookie 恢复有效，重置失败退避计数
                     self._reset_login_backoff()
+                    # 本地改造（2026-09-20）：cookie 已恢复，清理可能残留的「待命输入会话」
+                    # （暂停自动登录时注册了 24h 待命会话；若不清理会持续拦截用户消息）
+                    if self._input_session_ids:
+                        self._clear_code_input_session()
                 browser.close()
             self.__update_config()
         except Exception as e:
@@ -438,8 +458,19 @@ class WeWorkIPPW(_PluginBase):
                 return cookie_header
 
     def login(self):
-        logger.info("开始登录企业微信")
-        self.post_message(channel=MessageChannel.Wechat,mtype=NotificationType.Plugin,title = "开始登录企业微信",userid=self._qr_send_users)
+        # 本地改造（2026-09-20）：防重入——若已有登录在执行，直接跳过
+        # （refresh_cookie 每 5 分钟跑一次，若登录正等扫码，不能再起一个）
+        if self._login_running:
+            logger.info("已有登录流程正在执行，跳过本次登录")
+            return
+        self._login_running = True
+        try:
+            self._login_inner()
+        finally:
+            self._login_running = False
+
+    def _login_inner(self):
+        # 本地改造（2026-09-20）：先检查缓存，有效则静默返回，避免发无意义的「开始登录」通知
         logger.info("进行一次缓存检测")
         self.refresh_cookie(_login = False)
         if self._cookie_valid:
@@ -449,6 +480,8 @@ class WeWorkIPPW(_PluginBase):
             if self._scheduler.get_job("wwlogin"):
                 self._scheduler.remove_job("wwlogin")
             return
+        logger.info("开始登录企业微信")
+        self.post_message(channel=MessageChannel.Wechat,mtype=NotificationType.Plugin,title = "开始登录企业微信",userid=self._qr_send_users)
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
@@ -480,6 +513,9 @@ class WeWorkIPPW(_PluginBase):
                         page.on('framenavigated', on_new_url)
                         wait_time = 0
                         while not new_url:
+                            # 本地改造（2026-09-20）：插件停止时提前退出，避免阻塞重载
+                            if self._stop_flag:
+                                raise ValueError("插件停止,终止登录")
                             page.wait_for_timeout(1000)
                             wait_time += 1
                             if wait_time > 180:
@@ -500,6 +536,9 @@ class WeWorkIPPW(_PluginBase):
                                 while self._code == 0:
                                     time.sleep(2)
                                     wait_code_time += 2
+                                    # 本地改造（2026-09-20）：插件停止时提前退出
+                                    if self._stop_flag:
+                                        raise ValueError("插件停止,终止登录")
                                     if wait_code_time > 120:
                                         raise ValueError("验证超时,终止本次登录")
                                 input_element = page.locator('.inner_input')
@@ -562,16 +601,21 @@ class WeWorkIPPW(_PluginBase):
         """
         唤起企业微信登录任务。
         本地改造（2026-09-20）：新增 delay 参数（秒），用于失败退避后的延迟重试。
+        本地改造（2026-09-20）：恢复 job id="wwlogin"，并在创建前移除同名旧任务，
+        避免重复触发叠加（refresh_cookie 靠该 id 判断是否已有登录任务在排队）。
         """
         logger.info(f"唤起企业微信登录任务（{delay}s 后）")
         try:
+                # 先移除同名旧任务，避免叠加多个登录 job
+                if self._scheduler.get_job("wwlogin"):
+                    self._scheduler.remove_job("wwlogin")
                 self._scheduler.add_job(
                     func=self.login,
                     trigger="date",
                     run_date=datetime.now(tz=pytz.timezone(settings.TZ))
                     + timedelta(seconds=delay),
-                    name="唤起企业微信登录"
-                    #id="wwlogin"
+                    name="唤起企业微信登录",
+                    id="wwlogin",
                 )
         except Exception as err:
                 logger.error(f"定时唤起企业登录任务配置错误：{err}")
@@ -608,15 +652,16 @@ class WeWorkIPPW(_PluginBase):
             return
 
         if self._schedule_login:
-            # 计算退避延迟
-            idx = min(self._login_fail_count - 1, len(self._login_backoff_steps) - 1)
-            delay = self._login_backoff_steps[idx]
+            # 计算退避延迟（统一走 _next_login_delay）
+            delay = self._next_login_delay()
+            # 通知文案：不足 1 分钟用秒，否则用分钟
+            delay_desc = f"{delay} 秒" if delay < 60 else f"约 {delay // 60} 分钟"
             # 降噪：只在本次失败周期首轮发通知
             if not self._login_cycle_notified:
                 self.post_message(
                     channel=MessageChannel.Wechat, mtype=NotificationType.Plugin,
                     title="登录失败",
-                    text=f"已开启自动登录，将于约 {delay // 60} 分钟后重试。\n如需立即登录请回复\n#登录企业微信",
+                    text=f"已开启自动登录，将于 {delay_desc}后重试。\n如需立即登录请回复\n#登录企业微信",
                     userid=self._qr_send_users,
                 )
                 self._login_cycle_notified = True
@@ -630,6 +675,14 @@ class WeWorkIPPW(_PluginBase):
         """本地改造（2026-09-20）：登录成功后重置失败计数与降噪标记。"""
         self._login_fail_count = 0
         self._login_cycle_notified = False
+
+    def _next_login_delay(self) -> int:
+        """
+        本地改造（2026-09-20）：计算下一次登录重试的退避延迟（秒）。
+        按当前失败次数取退避阶梯，封顶 30 分钟。供 refresh_cookie 与 login_fail 统一使用。
+        """
+        idx = min(max(self._login_fail_count, 1) - 1, len(self._login_backoff_steps) - 1)
+        return self._login_backoff_steps[idx]
             
     def check_connect(self):
         try:
@@ -1321,14 +1374,22 @@ class WeWorkIPPW(_PluginBase):
     def stop_service(self):
         """
         退出插件
+        本地改造（2026-09-20）：
+        - 不再在主线程直接 close Playwright 浏览器（跨线程 close 会抛
+          "Cannot switch to a different thread"）。
+        - 改为置 _stop_flag，让 login() 的等待循环提前退出；
+          scheduler 用 shutdown(wait=False) 不阻塞，避免重载/停止被卡住。
+        - 浏览器由 login() 内的 with sync_playwright() 块自行关闭。
         """
         try:
-            if self._driver:
-                self._driver.close()
+            self._stop_flag = True
+            self._driver = None
             if self._scheduler:
                 if self._scheduler.running:
-                    self._scheduler.shutdown()
-                    self._scheduler.remove_all_jobs()
+                    try:
+                        self._scheduler.shutdown(wait=False)
+                    except TypeError:
+                        self._scheduler.shutdown()
                 self._scheduler = None
         except Exception as e:
             logger.error("退出插件失败：%s" % str(e))
