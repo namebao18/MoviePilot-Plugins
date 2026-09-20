@@ -16,6 +16,12 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.core.config import settings
 from app.helper.cookiecloud import CookieCloudHelper
+# 本地改造（2026-09-20）：接入 MP 新版「插件输入会话」接口。
+# 背景：MP 开启 AI_AGENT_GLOBAL 后，普通文本消息会优先被 AI Agent 接管，
+#       老插件依赖的 EventType.UserMessage 事件根本不会派发 ⇒ 验证码收不到。
+#       新接口 plugin_input_interaction_manager 优先级高于 AI Agent，
+#       插件注册后，MP 会把「下一条文本」以 MessageAction 事件定向投递给本插件。
+from app.helper.interaction import plugin_input_interaction_manager
 
 from playwright.sync_api import sync_playwright
 
@@ -26,8 +32,8 @@ class WeWorkIPPW(_PluginBase):
     plugin_desc = "!!docker用户用这个版本!!定时获取最新动态公网IP，配置到企业微信应用的可信IP列表里。"
     # 插件图标
     plugin_icon = "https://github.com/suraxiuxiu/MoviePilot-Plugins/blob/main/icons/micon.png?raw=true"
-    # 插件版本
-    plugin_version = "3.0.0"
+    # 插件版本（本地改造：4.0.0，适配 MP 新版 AI Agent 下的验证码输入会话机制）
+    plugin_version = "4.0.0"
     # 插件作者
     plugin_author = "suraxiuxiu"
     # 作者主页
@@ -80,6 +86,12 @@ class WeWorkIPPW(_PluginBase):
     _cookiecloud = CookieCloudHelper()
     _code = 0
     _pattern = r"^#\d{6}$"
+    # 本地改造（2026-09-20）：验证码输入会话的 request_id。
+    # 进入验证流程时注册「插件输入会话」，等待用户回复验证码；
+    # 收到 MessageAction 事件后据此判断是否为本插件的会话。
+    _input_session_id = None
+    # 支持 qr_send_users 配置多个用户时，逐个注册会话
+    _input_session_ids = []
     #cookie失效后定时唤起登录  如果关闭则手动调用登录
     _schedule_login = False
     _driver = None
@@ -459,6 +471,11 @@ class WeWorkIPPW(_PluginBase):
                             new_url = False
                             self.post_message(channel=MessageChannel.Wechat,mtype=NotificationType.Plugin,title = "检测到登录验证，请以 #123456 的格式回复验证码，两分钟后超时",userid=self._qr_send_users)
                             logger.info("检测到登录验证，进入验证流程")
+                            # 本地改造（2026-09-20）：注册「插件输入会话」。
+                            # MP 开启 AI_AGENT_GLOBAL 时，普通文本会先进 AI Agent，
+                            # 导致 UserMessage 事件不派发、插件收不到验证码；
+                            # 该会话的优先级高于 AI Agent，能把下一条文本定向投给本插件。
+                            self._register_code_input_session()
                             wait_code_time = 0
                             while 'mobile_confirm' in page.url:
                                 self._code = 0
@@ -478,6 +495,8 @@ class WeWorkIPPW(_PluginBase):
                                 if 'mobile_confirm' in page.url:
                                     self.post_message(channel=MessageChannel.Wechat,mtype=NotificationType.Plugin,title = "登录失败,请检查验证码并重新发送",userid=self._qr_send_users)
                                     logger.info("登录失败,请检查验证码并重新发送")
+                            # 本地改造（2026-09-20）：离开验证页后清理输入会话，避免继续拦截用户消息
+                            self._clear_code_input_session()
                         cookies = context.cookies()
                         cookies2 = ';'.join([f"{cookie['name']}={cookie['value']}" for cookie in cookies])
                         self._cookie_from_CC = self.parse_cookie_header(cookies2)
@@ -490,9 +509,12 @@ class WeWorkIPPW(_PluginBase):
                             self._scheduler.remove_job("wwlogin")
                     except Exception as e:
                         logger.error(f"登录超时:{e}")
+                        # 本地改造（2026-09-20）：异常退出时清理输入会话
+                        self._clear_code_input_session()
                         self.login_fail()
                 except Exception as e:
                     logger.error(f"登录失败:{e}")
+                    self._clear_code_input_session()
                     self.login_fail()
                 browser.close()
                 self._driver = None
@@ -501,6 +523,7 @@ class WeWorkIPPW(_PluginBase):
                 os.remove(self.qr_path)
         except Exception as e:
                 logger.error(f"登录失败:{e}")
+                self._clear_code_input_session()
                 self.login_fail()
     
     def create_refresh_job(self):
@@ -593,6 +616,85 @@ class WeWorkIPPW(_PluginBase):
                     + timedelta(seconds=3),
                     name="登录企业微信",
                 )
+
+    # 本地改造（2026-09-20）：新增 MessageAction 处理器，接收「插件输入会话」的定向投递。
+    # MP 开启 AI_AGENT_GLOBAL 时 UserMessage 事件不派发，验证码只能从这里进来。
+    # 载荷：text = "plugin_input|<request_id>"，真实用户输入在 input_text 字段。
+    @eventmanager.register(EventType.MessageAction)
+    def handle_message_action(self, event: Event):
+        """处理插件输入会话派发的消息（验证码等）。"""
+        if not self._enabled:
+            return
+        data = event.event_data or {}
+        # 只处理本插件注册的输入会话事件（MP 已按类名定向投递，这里再校验一次）
+        if not str(data.get("text", "")).startswith("plugin_input|"):
+            return
+        if data.get("plugin_id") != self.__class__.__name__:
+            return
+        # 会话 id 必须与本次登录注册的一致，避免串台
+        if self._input_session_ids and data.get("input_session_id") not in self._input_session_ids:
+            logger.info(f"忽略非本次登录会话的输入：{data.get('input_session_id')}")
+            return
+        input_text = (data.get("input_text") or "").strip()
+        if re.match(self._pattern, input_text):
+            self._code = input_text[1:]
+            logger.info(f"从插件输入会话收到验证码：{self._code}")
+            # MP 的 consume_by_user 是「消费即删除」，收到一次输入后会话即失效，
+            # 因此这里重新注册，保证验证码错误、需要重发时仍能收到下一条。
+            self._register_code_input_session()
+        else:
+            # 非验证码格式的输入：提示用户，并重新注册会话继续等待
+            logger.info(f"插件输入会话收到非验证码内容：{input_text}")
+            self.post_message(channel=MessageChannel.Wechat,mtype=NotificationType.Plugin,
+                              title="请以 #123456 的格式回复验证码",userid=self._qr_send_users)
+            self._register_code_input_session()
+
+    def _register_code_input_session(self):
+        """
+        本地改造（2026-09-20）：注册/刷新「验证码输入会话」。
+        MP 开启 AI_AGENT_GLOBAL 时，普通文本优先被 AI Agent 接管，
+        UserMessage 事件不派发；该会话优先级更高，可把下一条文本定向投给本插件。
+        plugin_id 必须用「类名」（MP 定向派发按类名匹配）。
+
+        ⚠️ 会话按 user_id 精确匹配（MP 内部 _keys_overlap 要求 user_id 相等，无通配），
+        所以必须用「真实发送消息的用户 ID」注册。这里取 qr_send_users：
+        - 配置了具体用户 → 逐个注册；
+        - 为空（推送给全体）→ 无法预知是谁发消息，保留旧 UserMessage 方式兜底。
+        """
+        users = [u.strip() for u in str(self._qr_send_users or "").split(",") if u.strip()]
+        if not users:
+            # 未配置具体用户：无法注册定向会话，退化为旧方式（依赖 UserMessage 事件）
+            self._input_session_id = None
+            logger.warning("qr_send_users 为空，无法注册验证码输入会话（请在该插件配置里填写接收登录消息的企业微信 userid）")
+            return
+        self._input_session_ids = []
+        for u in users:
+            try:
+                _input_req = plugin_input_interaction_manager.create_or_replace(
+                    user_id=u,
+                    plugin_id=self.__class__.__name__,
+                    channel=MessageChannel.Wechat,
+                    source=None,
+                    username=None,
+                    timeout_seconds=120,
+                )
+                self._input_session_ids.append(_input_req.request_id)
+                logger.info(f"已为用户 {u} 注册验证码输入会话：{_input_req.request_id}")
+            except Exception as e:
+                logger.error(f"为用户 {u} 注册验证码输入会话失败（将回退旧事件方式）：{e}")
+        # 兼容单会话字段
+        self._input_session_id = self._input_session_ids[0] if self._input_session_ids else None
+
+    def _clear_code_input_session(self):
+        """本地改造（2026-09-20）：清理验证码输入会话，避免登录结束后仍拦截用户消息。"""
+        for sid in list(self._input_session_ids or []):
+            try:
+                plugin_input_interaction_manager.remove(sid)
+                logger.info(f"已清理验证码输入会话：{sid}")
+            except Exception as e:
+                logger.error(f"清理验证码输入会话失败：{e}")
+        self._input_session_ids = []
+        self._input_session_id = None
     
     def send_cookie_status(self):
         if not self._cookie_valid:
