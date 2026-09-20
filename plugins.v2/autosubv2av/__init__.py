@@ -54,6 +54,10 @@ class TaskItem:
     add_time: datetime
     status: TaskStatus = TaskStatus.PENDING
     complete_time: datetime = None
+    # 本地改造（2026-09-20）：失败重试计数（宽松上限，容忍频繁重启打断）
+    retry_count: int = 0
+    # 最近一次失败是否由"插件停止/用户中断"造成（此类失败不计入 retry_count）
+    interrupted: bool = False
 
 
 class AutoSubv2AV(_PluginBase):
@@ -66,7 +70,7 @@ class AutoSubv2AV(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     # 插件作者
     plugin_author = "TimoYoung (AV modified)"
     # 作者主页
@@ -85,6 +89,8 @@ class AutoSubv2AV(_PluginBase):
     _current_processing_task = None
     _running = False
     _event = Event()
+    # 本地改造（2026-09-20）：失败重试上限（宽松，容忍频繁修改/重启测试造成的失败）
+    _max_retry = 8
     _enabled = None
     _clear_history = None
     _translate_preference = None
@@ -239,6 +245,9 @@ class AutoSubv2AV(_PluginBase):
                     status=TaskStatus(task_dict["status"]),
                     complete_time=datetime.fromisoformat(task_dict["complete_time"])
                     if task_dict.get("complete_time") else None,
+                    # 本地改造（2026-09-20）：兼容旧数据（无这些字段则用默认）
+                    retry_count=int(task_dict.get("retry_count") or 0),
+                    interrupted=bool(task_dict.get("interrupted") or False),
                 )
                 tasks[task_id] = task
             except Exception as e:
@@ -254,6 +263,9 @@ class AutoSubv2AV(_PluginBase):
             "add_time": task.add_time.isoformat() if task.add_time else None,
             "status": task.status.value,
             "complete_time": task.complete_time.isoformat() if task.complete_time else None,
+            # 本地改造（2026-09-20）：失败重试计数与中断标记
+            "retry_count": int(getattr(task, "retry_count", 0) or 0),
+            "interrupted": bool(getattr(task, "interrupted", False)),
         }
 
     def save_tasks(self):
@@ -271,7 +283,7 @@ class AutoSubv2AV(_PluginBase):
         而消费者取出任务后它就不在队列里了（只在 self._tasks 字典），
         导致 12 小时定时全量扫描时同一文件被反复入队（实测 7093 条仅 611 个文件）。
         现改为统一查 self._tasks：同一文件的「待处理/处理中」直接跳过；
-        「已完成/已忽略」也跳过（避免重复处理）；「失败」不跳过（允许重试）。
+        「已完成/已忽略」也跳过；「失败」需重试次数未超上限才允许重试。
         """
         task = TaskItem(
             task_id=str(uuid4()),
@@ -291,7 +303,14 @@ class AutoSubv2AV(_PluginBase):
             # 已完成 / 已忽略：无需重复处理，跳过
             if t.status in (TaskStatus.COMPLETED, TaskStatus.IGNORED):
                 return False
-            # 失败：允许重试（不跳过），继续走下面入队
+            # 失败：重试次数未超上限才允许重试（宽松上限，容忍频繁重启打断）
+            if t.status == TaskStatus.FAILED:
+                rc = int(getattr(t, 'retry_count', 0) or 0)
+                if rc >= self._max_retry:
+                    logger.info(f"[重试上限] 已失败 {rc} 次，放弃重试：{video_file}")
+                    return False
+                # 未超上限：允许重试（下面入队新任务）
+                break
 
         self._task_queue.put(task)
         self._tasks[task.task_id] = task
@@ -330,6 +349,16 @@ class AutoSubv2AV(_PluginBase):
                 self.save_tasks()
                 task.status = self.__process_autosub(task.video_file)
                 task.complete_time = datetime.now()
+                # 本地改造（2026-09-20）：失败重试计数
+                # - 中断（插件停止/重启）造成的失败不计入，避免频繁测试耗尽重试配额
+                # - 真失败才 +1，达 _max_retry 后不再重试
+                if task.status == TaskStatus.FAILED:
+                    if getattr(task, 'interrupted', False):
+                        task.interrupted = False   # 重置标记，下次可正常重试
+                        logger.info(f"任务因中断结束，不计入重试次数：{task.video_file}")
+                    else:
+                        task.retry_count = int(getattr(task, 'retry_count', 0) or 0) + 1
+                        logger.info(f"任务失败（第 {task.retry_count}/{self._max_retry} 次）：{task.video_file}")
                 self._tasks[task.task_id] = task
                 self.save_tasks()
                 self._task_queue.task_done()
@@ -635,6 +664,10 @@ class AutoSubv2AV(_PluginBase):
             return TaskStatus.COMPLETED
         except UserInterruptException:
             logger.info(f"用户中断当前任务：{video_file}")
+            # 本地改造（2026-09-20）：标记为"中断"，不计入失败重试次数
+            # （频繁修改/重启测试会打断任务，不应消耗重试配额）
+            if self._current_processing_task is not None:
+                self._current_processing_task.interrupted = True
             return TaskStatus.FAILED
         except Exception as e:
             logger.error(f"自动字幕生成 处理异常：{e}")
