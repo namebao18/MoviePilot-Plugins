@@ -18,7 +18,7 @@
   "WeWorkIPPW": {
     "name": "企微配置IPpw版",
     "description": "定时获取最新动态公网IP，配置到企业微信应用的可信IP列表里。（本地改造：适配 MP 新版 AI Agent 验证码输入会话）",
-    "version": "4.0.0",
+    "version": "4.1.0",
     "icon": "micon.png",
     "author": "suraxiuxiu",
     "level": 2

@@ -32,8 +32,8 @@ class WeWorkIPPW(_PluginBase):
     plugin_desc = "!!docker用户用这个版本!!定时获取最新动态公网IP，配置到企业微信应用的可信IP列表里。"
     # 插件图标
     plugin_icon = "https://github.com/suraxiuxiu/MoviePilot-Plugins/blob/main/icons/micon.png?raw=true"
-    # 插件版本（本地改造：4.0.0，适配 MP 新版 AI Agent 下的验证码输入会话机制）
-    plugin_version = "4.0.0"
+    # 插件版本（本地改造：4.1.0，适配 MP 新版 AI Agent；含登录失败退避+降噪+上限）
+    plugin_version = "4.1.0"
     # 插件作者
     plugin_author = "suraxiuxiu"
     # 作者主页
@@ -94,6 +94,16 @@ class WeWorkIPPW(_PluginBase):
     _input_session_ids = []
     #cookie失效后定时唤起登录  如果关闭则手动调用登录
     _schedule_login = False
+    # 本地改造（2026-09-20）：登录失败退避 + 通知降噪 + 重试上限
+    # 背景：原逻辑 cookie 失效后会「失败 → 5 秒后立即重试 → 再失败」无限循环，
+    #       每轮（约3分钟）发「开始登录 + 二维码 + 登录失败」三条消息 ⇒ 消息轰炸。
+    # 策略：失败次数越多、重试间隔越长（指数退避，封顶 30 分钟）；
+    #       同一失败周期内只在首轮发通知；连续失败达上限则暂停自动登录，改为手动触发。
+    _login_fail_count = 0          # 当前连续登录失败次数
+    _login_cycle_notified = False  # 本次失败周期是否已发过通知（降噪用）
+    # 退避阶梯（秒）：第 1~5 次失败依次等待，之后封顶 30 分钟
+    _login_backoff_steps = [60, 300, 900, 1800]
+    _login_max_retry = 10          # 连续失败达此数则暂停自动登录
     _driver = None
     _refresh_lock = threading.Lock()
     # 定时器
@@ -110,6 +120,9 @@ class WeWorkIPPW(_PluginBase):
         self._cookie_valid = False
         self._ip_changed = True
         self._urls = []
+        # 本地改造（2026-09-20）：重置登录失败退避状态（类属性不随实例重置，需显式清零）
+        self._reset_login_backoff()
+        self._clear_code_input_session()
         if config:
             self._enabled = config.get("enabled")
             self._check_cron = config.get("cron")
@@ -331,7 +344,8 @@ class WeWorkIPPW(_PluginBase):
                     logger.error('cookie为空,请检查CC配置和插件手动填写项')
                     browser.close()
                     self._cookie_valid = False
-                    if self._schedule_login:
+                    # 本地改造（2026-09-20）：已暂停自动登录（连续失败达上限）则不再自动重登
+                    if self._schedule_login and self._login_fail_count < self._login_max_retry:
                         if self._scheduler.get_job("refresh_cookie"):
                             self._scheduler.remove_job("refresh_cookie")
                         if not self._scheduler.get_job("wwlogin") and _login:
@@ -346,7 +360,8 @@ class WeWorkIPPW(_PluginBase):
                 if login.is_visible():
                     logger.info("cookie失效,请重新获取")
                     self._cookie_valid = False
-                    if self._schedule_login:
+                    # 本地改造（2026-09-20）：已暂停自动登录则不再自动重登
+                    if self._schedule_login and self._login_fail_count < self._login_max_retry:
                         if self._scheduler.get_job("refresh_cookie"):
                             self._scheduler.remove_job("refresh_cookie")
                         if not self._scheduler.get_job("wwlogin") and _login:
@@ -356,6 +371,8 @@ class WeWorkIPPW(_PluginBase):
                 else:
                     logger.info("cookie有效校验成功")
                     self._cookie_valid = True
+                    # 本地改造（2026-09-20）：cookie 恢复有效，重置失败退避计数
+                    self._reset_login_backoff()
                 browser.close()
             self.__update_config()
         except Exception as e:
@@ -501,6 +518,8 @@ class WeWorkIPPW(_PluginBase):
                         cookies2 = ';'.join([f"{cookie['name']}={cookie['value']}" for cookie in cookies])
                         self._cookie_from_CC = self.parse_cookie_header(cookies2)
                         self._cookie_valid = True
+                        # 本地改造（2026-09-20）：登录成功，重置失败退避计数与降噪标记
+                        self._reset_login_backoff()
                         self.post_message(channel=MessageChannel.Wechat,mtype=NotificationType.Plugin,title = "登录企业微信成功",userid=self._qr_send_users)
                         logger.info("登录企业微信成功")
                         if not self._scheduler.get_job("refresh_cookie"):
@@ -539,14 +558,18 @@ class WeWorkIPPW(_PluginBase):
                 logger.error(f"定时刷新企业微信缓存任务配置错误：{err}")
                 self.systemmessage.put(f"定时刷新企业微信缓存任务配置错误：{err}")
         
-    def create_login_job(self):
-        logger.info("唤起企业微信登录任务")
+    def create_login_job(self, delay: int = 5):
+        """
+        唤起企业微信登录任务。
+        本地改造（2026-09-20）：新增 delay 参数（秒），用于失败退避后的延迟重试。
+        """
+        logger.info(f"唤起企业微信登录任务（{delay}s 后）")
         try:
                 self._scheduler.add_job(
                     func=self.login,
                     trigger="date",
                     run_date=datetime.now(tz=pytz.timezone(settings.TZ))
-                    + timedelta(seconds=5),
+                    + timedelta(seconds=delay),
                     name="唤起企业微信登录"
                     #id="wwlogin"
                 )
@@ -555,12 +578,58 @@ class WeWorkIPPW(_PluginBase):
                 self.systemmessage.put(f"定时唤起企业登录配置错误：{err}")
 
     def login_fail(self):
+        """
+        登录失败处理（本地改造 2026-09-20：退避 + 降噪 + 上限）。
+        原逻辑：失败后固定 5 秒重试，无限循环且每轮都发通知 ⇒ 消息轰炸。
+        现逻辑：
+          - 失败次数 +1，按退避阶梯计算下次重试延迟（1m/5m/15m/30m 封顶）；
+          - 同一失败周期内只发首条「登录失败」通知，后续静默（降噪）；
+          - 连续失败达 _login_max_retry 则暂停自动登录，提示手动触发。
+        """
         self._cookie_valid = False
+        self._login_fail_count += 1
+
+        # 达重试上限：暂停自动登录，改为手动触发（保留"随时可登录"）
+        if self._schedule_login and self._login_fail_count >= self._login_max_retry:
+            logger.warning(f"企业微信自动登录已连续失败 {self._login_fail_count} 次，暂停自动重试")
+            self.post_message(
+                channel=MessageChannel.Wechat, mtype=NotificationType.Plugin,
+                title="企业微信自动登录已暂停",
+                text=(f"已连续失败 {self._login_fail_count} 次，为免打扰已暂停自动重试。\n"
+                      f"需要登录时请回复\n#登录企业微信"),
+                userid=self._qr_send_users,
+            )
+            # 注册长期待命输入会话，让用户随时能回复 #登录企业微信 手动触发
+            # （AI Agent 全局开启时普通文本会被 Agent 抢走，必须靠该会话接住）
+            self._register_code_input_session(timeout_seconds=86400)
+            # 恢复定时刷新检查（若之前被移除），以便 cookie 恢复后能自动识别
+            if not self._scheduler.get_job("refresh_cookie"):
+                self.create_refresh_job()
+            return
+
         if self._schedule_login:
-            self.post_message(channel=MessageChannel.Wechat,mtype=NotificationType.Plugin,title = "登录失败",text = "已开启自动登录，即将开始下一轮登录。",userid=self._qr_send_users)
-            self.create_login_job()
+            # 计算退避延迟
+            idx = min(self._login_fail_count - 1, len(self._login_backoff_steps) - 1)
+            delay = self._login_backoff_steps[idx]
+            # 降噪：只在本次失败周期首轮发通知
+            if not self._login_cycle_notified:
+                self.post_message(
+                    channel=MessageChannel.Wechat, mtype=NotificationType.Plugin,
+                    title="登录失败",
+                    text=f"已开启自动登录，将于约 {delay // 60} 分钟后重试。\n如需立即登录请回复\n#登录企业微信",
+                    userid=self._qr_send_users,
+                )
+                self._login_cycle_notified = True
+            else:
+                logger.info(f"登录失败第 {self._login_fail_count} 次（静默，退避 {delay}s 后重试）")
+            self.create_login_job(delay=delay)
         else:
             self.post_message(channel=MessageChannel.Wechat,mtype=NotificationType.Plugin,title = "登录失败",text = "如需再次登录，请回复\n#登录企业微信",userid=self._qr_send_users)
+
+    def _reset_login_backoff(self):
+        """本地改造（2026-09-20）：登录成功后重置失败计数与降噪标记。"""
+        self._login_fail_count = 0
+        self._login_cycle_notified = False
             
     def check_connect(self):
         try:
@@ -609,6 +678,8 @@ class WeWorkIPPW(_PluginBase):
             if self._cookie_valid:
                 self.post_message(channel=MessageChannel.Wechat,mtype=NotificationType.Plugin,title = "缓存有效，无需登录",userid=self._qr_send_users)
                 return
+            # 本地改造（2026-09-20）：手动触发登录视为新周期，重置退避计数
+            self._reset_login_backoff()
             self._scheduler.add_job(
                     func=self.login,
                     trigger="date",
@@ -618,11 +689,11 @@ class WeWorkIPPW(_PluginBase):
                 )
 
     # 本地改造（2026-09-20）：新增 MessageAction 处理器，接收「插件输入会话」的定向投递。
-    # MP 开启 AI_AGENT_GLOBAL 时 UserMessage 事件不派发，验证码只能从这里进来。
+    # MP 开启 AI_AGENT_GLOBAL 时 UserMessage 事件不派发，验证码/登录命令只能从这里进来。
     # 载荷：text = "plugin_input|<request_id>"，真实用户输入在 input_text 字段。
     @eventmanager.register(EventType.MessageAction)
     def handle_message_action(self, event: Event):
-        """处理插件输入会话派发的消息（验证码等）。"""
+        """处理插件输入会话派发的消息（验证码 / 登录命令）。"""
         if not self._enabled:
             return
         data = event.event_data or {}
@@ -636,6 +707,26 @@ class WeWorkIPPW(_PluginBase):
             logger.info(f"忽略非本次登录会话的输入：{data.get('input_session_id')}")
             return
         input_text = (data.get("input_text") or "").strip()
+
+        # 情形一：用户回复登录命令（用于暂停自动登录后的手动触发）
+        if input_text == "#登录企业微信":
+            logger.info("从插件输入会话收到登录命令")
+            if self._cookie_valid:
+                self.post_message(channel=MessageChannel.Wechat, mtype=NotificationType.Plugin,
+                                  title="缓存有效，无需登录", userid=self._qr_send_users)
+                self._register_code_input_session()  # 保持待命
+                return
+            self._reset_login_backoff()
+            self._clear_code_input_session()
+            self._scheduler.add_job(
+                func=self.login,
+                trigger="date",
+                run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                name="登录企业微信",
+            )
+            return
+
+        # 情形二：验证码
         if re.match(self._pattern, input_text):
             self._code = input_text[1:]
             logger.info(f"从插件输入会话收到验证码：{self._code}")
@@ -649,9 +740,9 @@ class WeWorkIPPW(_PluginBase):
                               title="请以 #123456 的格式回复验证码",userid=self._qr_send_users)
             self._register_code_input_session()
 
-    def _register_code_input_session(self):
+    def _register_code_input_session(self, timeout_seconds: int = 120):
         """
-        本地改造（2026-09-20）：注册/刷新「验证码输入会话」。
+        本地改造（2026-09-20）：注册/刷新「插件输入会话」。
         MP 开启 AI_AGENT_GLOBAL 时，普通文本优先被 AI Agent 接管，
         UserMessage 事件不派发；该会话优先级更高，可把下一条文本定向投给本插件。
         plugin_id 必须用「类名」（MP 定向派发按类名匹配）。
@@ -660,6 +751,8 @@ class WeWorkIPPW(_PluginBase):
         所以必须用「真实发送消息的用户 ID」注册。这里取 qr_send_users：
         - 配置了具体用户 → 逐个注册；
         - 为空（推送给全体）→ 无法预知是谁发消息，保留旧 UserMessage 方式兜底。
+
+        :param timeout_seconds: 会话有效期（验证码场景 120s；待命等待登录命令场景可设长）
         """
         users = [u.strip() for u in str(self._qr_send_users or "").split(",") if u.strip()]
         if not users:
@@ -676,12 +769,12 @@ class WeWorkIPPW(_PluginBase):
                     channel=MessageChannel.Wechat,
                     source=None,
                     username=None,
-                    timeout_seconds=120,
+                    timeout_seconds=timeout_seconds,
                 )
                 self._input_session_ids.append(_input_req.request_id)
-                logger.info(f"已为用户 {u} 注册验证码输入会话：{_input_req.request_id}")
+                logger.info(f"已为用户 {u} 注册插件输入会话：{_input_req.request_id}（{timeout_seconds}s）")
             except Exception as e:
-                logger.error(f"为用户 {u} 注册验证码输入会话失败（将回退旧事件方式）：{e}")
+                logger.error(f"为用户 {u} 注册插件输入会话失败（将回退旧事件方式）：{e}")
         # 兼容单会话字段
         self._input_session_id = self._input_session_ids[0] if self._input_session_ids else None
 
