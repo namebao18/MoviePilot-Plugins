@@ -66,7 +66,7 @@ class AutoSubv2AV(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "TimoYoung (AV modified)"
     # 作者主页
@@ -265,6 +265,13 @@ class AutoSubv2AV(_PluginBase):
         添加新任务到队列和任务列表中，若任务已存在则跳过。
         :param video_file: 视频文件路径
         :param source: 任务来源（手动/事件）
+
+        本地改造（2026-09-20）：修复"任务队列爆炸"bug。
+        旧逻辑只用 __is_duplicate_task 查「内存队列 + 当前处理项」，
+        而消费者取出任务后它就不在队列里了（只在 self._tasks 字典），
+        导致 12 小时定时全量扫描时同一文件被反复入队（实测 7093 条仅 611 个文件）。
+        现改为统一查 self._tasks：同一文件的「待处理/处理中」直接跳过；
+        「已完成/已忽略」也跳过（避免重复处理）；「失败」不跳过（允许重试）。
         """
         task = TaskItem(
             task_id=str(uuid4()),
@@ -273,14 +280,18 @@ class AutoSubv2AV(_PluginBase):
             add_time=datetime.now()
         )
 
-        if self.__is_duplicate_task(task.video_file):
-            logger.info(f"任务已存在，跳过添加：{video_file}")
-            return False
-
-        # 特调：已完成过的任务也跳过（避免每次全量重新入队）
+        # 统一去重：检查 self._tasks 中同一文件的所有任务状态
+        # （不再只查内存队列——消费者取走后队列就空了，会漏判）
         for t in (self._tasks or {}).values():
-            if t.video_file == task.video_file and t.status in (TaskStatus.COMPLETED, TaskStatus.IGNORED):
+            if t.video_file != task.video_file:
+                continue
+            # 待处理 / 处理中：已在排队或正在处理，跳过
+            if t.status in (TaskStatus.PENDING, TaskStatus.IN_PROGRESS):
                 return False
+            # 已完成 / 已忽略：无需重复处理，跳过
+            if t.status in (TaskStatus.COMPLETED, TaskStatus.IGNORED):
+                return False
+            # 失败：允许重试（不跳过），继续走下面入队
 
         self._task_queue.put(task)
         self._tasks[task.task_id] = task
@@ -296,6 +307,7 @@ class AutoSubv2AV(_PluginBase):
         logger.info("插件历史任务已清除")
 
     def __is_duplicate_task(self, video_file: str) -> bool:
+        """检查同一文件是否已在内存队列或正在处理中（保留供其它调用点使用）。"""
         with self._task_queue.mutex:
             for task in self._task_queue.queue:
                 if task.video_file == video_file:
