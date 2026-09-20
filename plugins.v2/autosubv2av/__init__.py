@@ -70,7 +70,7 @@ class AutoSubv2AV(_PluginBase):
     # 主题色
     plugin_color = "#2C4F7E"
     # 插件版本
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.4"
     # 插件作者
     plugin_author = "TimoYoung (AV modified)"
     # 作者主页
@@ -283,7 +283,8 @@ class AutoSubv2AV(_PluginBase):
         而消费者取出任务后它就不在队列里了（只在 self._tasks 字典），
         导致 12 小时定时全量扫描时同一文件被反复入队（实测 7093 条仅 611 个文件）。
         现改为统一查 self._tasks：同一文件的「待处理/处理中」直接跳过；
-        「已完成/已忽略」也跳过；「失败」需重试次数未超上限才允许重试。
+        「已完成/已忽略」也跳过；「失败」需重试次数未超上限，且**复用旧任务对象**
+        （保留 retry_count，避免每次重试都新建记录导致历史堆积）。
         """
         task = TaskItem(
             task_id=str(uuid4()),
@@ -309,8 +310,16 @@ class AutoSubv2AV(_PluginBase):
                 if rc >= self._max_retry:
                     logger.info(f"[重试上限] 已失败 {rc} 次，放弃重试：{video_file}")
                     return False
-                # 未超上限：允许重试（下面入队新任务）
-                break
+                # 未超上限：**复用旧任务对象**（重置状态重新入队，保留 retry_count）
+                # —— 避免每次重试都新建记录，导致同一文件出现多条历史 failed
+                t.status = TaskStatus.PENDING
+                t.complete_time = None
+                t.interrupted = False
+                self._task_queue.put(t)
+                self._tasks[t.task_id] = t
+                self.save_tasks()
+                logger.info(f"加入任务队列（重试 {rc}/{self._max_retry}）: {video_file}")
+                return True
 
         self._task_queue.put(task)
         self._tasks[task.task_id] = task
@@ -1904,6 +1913,9 @@ class AutoSubv2AV(_PluginBase):
                 task = self._tasks[task_id]
                 if task.status == TaskStatus.PENDING or task.status == TaskStatus.IN_PROGRESS:
                     task.status = TaskStatus.FAILED
+                    # 本地改造（2026-09-20）：插件停止时队列里未处理的任务属于"中断"而非"真失败"，
+                    # 标记 interrupted=True → 不计入重试次数（频繁重载/重启测试不会耗尽重试配额）
+                    task.interrupted = True
                     task.complete_time = datetime.now()
             self.save_tasks()  # 持久化更新后的任务列表
         self._running = False
