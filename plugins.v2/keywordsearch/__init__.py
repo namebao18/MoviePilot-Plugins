@@ -42,7 +42,7 @@
     最终入库刮削由下载完成后的 transfer 流程按真实文件做。本搜索工具不影响
     入库刮削，只影响"搜到什么、怎么展示"。
 
-版本：1.2.0
+版本：1.3.0
 作者：local
 """
 
@@ -168,17 +168,41 @@ class SearchTorrentsByKeywordTool(MoviePilotTool):
         """
         标题 + 站点分类/标签的启发式类型判断（不访问网络）。
 
+        说明：这是"尽力而为"的粗判，可能有误，故对不确定情形返回 uncertain=True。
+
         :return: (kind, uncertain) kind ∈ movie/tv/anime/unknown；uncertain 表示不确定
         """
-        text = (title or "").lower()
+        raw = title or ""
+        text = raw.lower()
         label_text = " ".join(labels or [])
-        if any(kw.lower() in text for kw in _ANIME_KEYWORDS) or any(
-            kw in label_text for kw in ("动画", "动漫", "anime")
-        ):
+
+        # 动漫判断收紧：优先看标题关键词；标签"动画"单独不足以判定为动漫
+        # （很多真人影视的站点标签也会带"动画"，如"全职高手之巅峰荣耀"电影），
+        # 因此标签仅作辅助：要求标题也含动漫线索，或标题无"剧集/季"标记时才采纳。
+        # 动漫判断：优先看标题关键词；标签"动画/动漫"仅作弱证据（uncertain=True），
+        # 因为很多真人影视的站点标签也会带"动画"（如动画风格海报剧场版）。
+        title_has_anime = any(kw.lower() in text for kw in _ANIME_KEYWORDS)
+        label_has_anime = any(kw in label_text for kw in ("动画", "动漫", "anime"))
+        # 季集标记：S01/S01E01/E01/EP01/第N季；集号限 1~2 位，避免把 E1080 之类误判
+        has_season = bool(re.search(
+            r"(?<![A-Za-z0-9])[sS]\d{1,2}(?:[eE]\d{1,2})?(?![0-9])"
+            r"|第[一二三四五六七八九十\d]{1,2}季",
+            raw,
+        ))
+        has_episode = bool(re.search(
+            r"(?<![A-Za-z0-9])[eE][pP]?\d{1,2}(?![0-9])",
+            raw,
+        ))
+        if title_has_anime:
             return "anime", False
+        if label_has_anime and not (has_season or has_episode):
+            # 标签提示动漫但无季集标记：可能动漫，也可能真人——标记为不确定
+            return "anime", True
+
         # 有明确的季集标记 -> 剧集
-        if re.search(r"[sS]\d{1,2}(\b|E\d+)|第\d+季|EP?\d{1,3}\b", title or ""):
+        if has_season or has_episode:
             return "tv", False
+
         # 站点分类字段（中文）作为弱线索
         cat = category or ""
         if cat in ("电影", "Movie"):
@@ -186,6 +210,47 @@ class SearchTorrentsByKeywordTool(MoviePilotTool):
         if cat in ("电视剧", "TV", "剧集"):
             return "tv", True
         return "unknown", True
+
+    @staticmethod
+    def _build_relevance_notice(
+        keyword: str,
+        selected_contexts: List[Any],
+        recognized_map: Dict[str, Any],
+        recognize: bool,
+        total_count: int,
+    ) -> Optional[str]:
+        """
+        构造"相关性/完整性"提示，帮助 Agent 判断结果是否可信。
+
+        - 已识别：用"不同 TMDB ID 数量"判断是否混入多部不同作品（关键词泛化）。
+        - 未识别：结果偏少时提示"不代表没有，可换关键词/别名再试"。
+
+        :return: 提示文本；无需提示时返回 None
+        """
+        if recognize and recognized_map:
+            tmdb_ids = {
+                getattr(m, "tmdb_id", None) for m in recognized_map.values()
+                if getattr(m, "tmdb_id", None)
+            }
+            if len(tmdb_ids) > 1:
+                titles = sorted({
+                    f"{getattr(m, 'title', '')}({getattr(m, 'year', '') or '?'})"
+                    for m in recognized_map.values() if getattr(m, "title", None)
+                })
+                return (
+                    f"关键词“{keyword}”命中了 {len(tmdb_ids)} 部不同作品："
+                    + "、".join(titles[:6])
+                    + ("…" if len(titles) > 6 else "")
+                    + "。请让用户确认要哪一部，避免混下。"
+                )
+            return None
+        # 未识别且结果很少：给保守提示
+        if total_count <= 2:
+            return (
+                f"仅匹配到 {total_count} 条且未做媒体识别，不能据此断定资源稀缺；"
+                "可换关键词/别名/英文原名，或开启 recognize=true 后再判断。"
+            )
+        return None
 
     async def _recognize_unique_titles(
         self, contexts: List[Any]
@@ -353,10 +418,19 @@ class SearchTorrentsByKeywordTool(MoviePilotTool):
                     if media_info and not getattr(context, "media_info", None):
                         context.media_info = media_info
                 if media_info and getattr(media_info, "type", None):
-                    kind = "movie" if media_info.type == MediaType.MOVIE else "tv"
-                    # 动漫若无独立类型（归 TV），用标题/标签再判一次
+                    # 映射识别出的正式类型：MOVIE->movie，TV/COLLECTION->tv，UNKNOWN->启发式
+                    if media_info.type == MediaType.MOVIE:
+                        kind = "movie"
+                    elif media_info.type in (MediaType.TV, MediaType.COLLECTION):
+                        kind = "tv"
+                    else:
+                        kind = self._heuristic_kind(title, category, labels)[0]
+                    # 动漫无独立类型（归 TV），用"识别后的正式标题"再判一次，
+                    # 避免用站点原始乱码标题误判（如带"动画"标签的真人剧场版）
                     if kind == "tv":
-                        hk, _ = self._heuristic_kind(title, category, labels)
+                        rec_title = getattr(media_info, "title", None) or ""
+                        rec_labels = labels
+                        hk, _ = self._heuristic_kind(rec_title, category, rec_labels)
                         if hk == "anime":
                             kind = "anime"
                     kind_map[idx] = kind
@@ -379,6 +453,9 @@ class SearchTorrentsByKeywordTool(MoviePilotTool):
             dist: Dict[str, int] = {}
             for idx in kind_map:
                 dist[kind_map[idx]] = dist.get(kind_map[idx], 0) + 1
+
+            # 过滤后的上下文（供 filter_options 使用，保证与已过滤结果一致）
+            selected_contexts = [ctx for _, ctx in selected]
 
             if total_count == 0:
                 payload = {
@@ -425,7 +502,7 @@ class SearchTorrentsByKeywordTool(MoviePilotTool):
                 "page": page,
                 "total_pages": total_pages,
                 "results": results,
-                "filter_options": build_filter_options(contexts),
+                "filter_options": build_filter_options(selected_contexts),
                 "all_sites": all_sites,
                 "search_site_ids": search_site_ids,
                 "message": (
@@ -433,6 +510,13 @@ class SearchTorrentsByKeywordTool(MoviePilotTool):
                     "可继续使用 get_search_results 做筛选、add_download_tasks 下载。"
                 ),
             }
+            # 相关性提示：关键词搜索按字面匹配，可能带回同名/泛化的无关作品。
+            # 若已识别，则用"不同 TMDB ID 的数量"判断是否混入多部作品，给出明确提示。
+            relevance_notice = self._build_relevance_notice(
+                keyword, selected_contexts, recognized_map, recognize, total_count
+            )
+            if relevance_notice:
+                payload["relevance_notice"] = relevance_notice
             if not recognize:
                 payload["message"] += (
                     " 注意：本次未做媒体识别，media_kind 为启发式结果（type_uncertain=true 表示不确定）；"
@@ -460,7 +544,7 @@ class KeywordSearch(_PluginBase):
         "支持按 movie/tv/anime 过滤与并发深度识别，便于处理同名多版本（多季/电影/动漫）结果。"
     )
     plugin_icon = "search.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "local"
     plugin_config_prefix = "keywordsearch_"
     plugin_order = 50
