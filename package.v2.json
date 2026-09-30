@@ -50,7 +50,7 @@
   "KeywordSearch": {
     "name": "关键词搜索种子",
     "description": "为 AI Agent 提供按关键词搜索站点种子 + 按关键词创建订阅的工具（默认开洗版），弥补内置按媒体 ID/标题搜索的漏检问题。命名不规范时用关键词，ID 仅作辅助。",
-    "version": "1.6.0",
+    "version": "1.7.0",
     "icon": "search.png",
     "author": "local",
     "level": 1
