@@ -42,7 +42,7 @@
     最终入库刮削由下载完成后的 transfer 流程按真实文件做。本搜索工具不影响
     入库刮削，只影响"搜到什么、怎么展示"。
 
-版本：1.3.0
+版本：1.4.0
 作者：local
 """
 
@@ -141,6 +141,11 @@ class SearchTorrentsByKeywordTool(MoviePilotTool):
         "multiple year versions, or when the built-in search_torrents (ID-based) "
         "returns too few or no results. Results are cached so get_search_results and "
         "add_download_tasks can be used afterwards. "
+        "PREFER this tool whenever the site naming may be non-standard / localized / "
+        "aliased (indexer titles often differ from TMDB titles); it is the reliable "
+        "fallback when the ID-based search misses resources. "
+        "After confirming the keyword returns the desired resources, reuse the same "
+        "keyword with `add_subscribe_by_keyword` to create a keyword-based subscription. "
         "IMPORTANT: keyword search does NOT identify media, so the type field is "
         "usually unknown; each result is annotated with media_kind plus type_uncertain. "
         "When the same name returns mixed versions (TV seasons / movie / anime), set "
@@ -534,17 +539,234 @@ class SearchTorrentsByKeywordTool(MoviePilotTool):
             return error_message
 
 
+class AddSubscribeByKeywordInput(BaseModel):
+    """关键词订阅工具的输入参数模型"""
+
+    title: str = Field(
+        ...,
+        description=(
+            "The display title of the media to subscribe to (e.g., '全职高手'). "
+            "Used for the subscription record and media identification."
+        ),
+    )
+    year: str = Field(
+        ...,
+        description="Release year of the media (required for accurate identification).",
+    )
+    media_type: str = Field(..., description="Allowed values: movie, tv")
+    keyword: str = Field(
+        ...,
+        description=(
+            "Custom search keyword used INSTEAD of the identified title when searching "
+            "indexer sites. Use this when the site naming is non-standard / localized / "
+            "aliased and ID-based search misses resources (e.g., '全职高手 动画', "
+            "'My Friend Maisy'). The subscription stores tmdb_id too (ID as auxiliary), "
+            "but searching uses this keyword."
+        ),
+    )
+    season: Optional[int] = Field(
+        None,
+        description=(
+            "Season number for TV shows (optional). If omitted, defaults to season 1. "
+            "Subscribe each season separately for multiple seasons."
+        ),
+    )
+    tmdb_id: Optional[int] = Field(
+        None, description="TMDB ID for precise identification/display (from search_media)."
+    )
+    douban_id: Optional[str] = Field(None, description="Douban ID (optional).")
+    bangumi_id: Optional[int] = Field(None, description="Bangumi media ID (optional).")
+    anilist_id: Optional[int] = Field(None, description="AniList media ID (optional).")
+    media_source: Optional[str] = Field(None, description="Media metadata source.")
+    media_id: Optional[str] = Field(None, description="Native ID for media_source.")
+    start_episode: Optional[int] = Field(None, description="Starting episode number (TV).")
+    total_episode: Optional[int] = Field(None, description="Total episodes (TV).")
+    quality: Optional[str] = Field(None, description="Quality filter regex (optional).")
+    resolution: Optional[str] = Field(None, description="Resolution filter regex (optional).")
+    effect: Optional[str] = Field(None, description="Effect filter regex (optional).")
+    filter_groups: Optional[List[str]] = Field(None, description="Filter rule groups (optional).")
+    sites: Optional[List[int]] = Field(None, description="Site IDs to search (optional).")
+
+
+class AddSubscribeByKeywordTool(MoviePilotTool):
+    """
+    按自定义关键词添加订阅的 Agent 工具。
+
+    与内置 add_subscribe 的区别：内置订阅只用 TMDB 识别出的**标题**去搜站，当站点
+    命名不规范（中文/别名/英文原名与 TMDB 标题不一致）时会漏检；本工具允许传入
+    `keyword`，订阅搜索时**用该关键词替代 TMDB 标题**（ID 仍保存，作识别/展示辅助）。
+
+    原理：SubscribeChain.add(**kwargs) 会透传 keyword 到 Subscribe 模型；
+    订阅搜索调用 SearchChain.process(keyword=subscribe.keyword) 时，
+    若 keyword 非空则【只用该关键词】搜索站点（见 MP 源码 __prepare_params）。
+    """
+
+    name: str = "add_subscribe_by_keyword"
+    tags: list[str] = [
+        ToolTag.Write,
+        ToolTag.Subscription,
+        ToolTag.Media,
+    ]
+    description: str = (
+        "Add a media subscription that searches indexer sites by a CUSTOM KEYWORD "
+        "instead of the identified title (the ID is still stored for identification). "
+        "PREFER this tool over `add_subscribe` when site naming is non-standard, "
+        "localized, aliased, or when a title-based search is likely to miss resources "
+        "— e.g. the indexer titles differ from the TMDB title, the media has a Chinese "
+        "/ alternate name, or the user explicitly gives a keyword. "
+        "Do NOT use it when the TMDB title is clean and standard (use `add_subscribe`). "
+        "When unsure, first call `search_torrents_by_keyword` to confirm the keyword "
+        "actually returns the desired resources, then subscribe with the same keyword. "
+        "Choose a keyword specific enough to avoid grabbing unrelated same-name works. "
+        "For TV, omitting season defaults to season 1; subscribe each season separately."
+    )
+    args_schema: Type[BaseModel] = AddSubscribeByKeywordInput
+
+    def get_tool_message(self, **kwargs) -> Optional[str]:
+        """返回工具执行提示"""
+        title = kwargs.get("title", "")
+        year = kwargs.get("year", "")
+        keyword = kwargs.get("keyword", "")
+        season = kwargs.get("season")
+        message = f"关键词订阅: {title} ({year}) 关键词=「{keyword}」"
+        if season is not None:
+            message += f" 第{season}季"
+        return message
+
+    async def _resolve_subscribe_username(self) -> Optional[str]:
+        """优先映射为系统用户名，未绑定时回退当前渠道用户名。"""
+        from app.db.user_oper import UserOper
+        from app.schemas.types import MessageChannel
+
+        resolved_username = self._username
+        if not self._channel or not self._user_id:
+            return resolved_username
+        try:
+            channel = MessageChannel(self._channel)
+        except ValueError:
+            return resolved_username
+        binding_keys = {
+            MessageChannel.Telegram: ("telegram_userid",),
+            MessageChannel.Discord: ("discord_userid",),
+            MessageChannel.Wechat: ("wechat_userid",),
+            MessageChannel.Feishu: ("feishu_userid", "feishu_openid"),
+            MessageChannel.WechatClawBot: ("wechatclawbot_userid",),
+            MessageChannel.Slack: ("slack_userid",),
+            MessageChannel.VoceChat: ("vocechat_userid",),
+            MessageChannel.SynologyChat: ("synologychat_userid",),
+            MessageChannel.QQ: ("qq_userid", "qq_openid"),
+        }.get(channel)
+        if not binding_keys:
+            return resolved_username
+        mapped = await self.run_blocking(
+            "db", UserOper().get_name, **{key: self._user_id for key in binding_keys}
+        )
+        return mapped or resolved_username
+
+    async def run(
+        self,
+        title: str,
+        year: str,
+        media_type: str,
+        keyword: str,
+        season: Optional[int] = None,
+        tmdb_id: Optional[int] = None,
+        douban_id: Optional[str] = None,
+        bangumi_id: Optional[int] = None,
+        anilist_id: Optional[int] = None,
+        media_source: Optional[str] = None,
+        media_id: Optional[str] = None,
+        start_episode: Optional[int] = None,
+        total_episode: Optional[int] = None,
+        quality: Optional[str] = None,
+        resolution: Optional[str] = None,
+        effect: Optional[str] = None,
+        filter_groups: Optional[List[str]] = None,
+        sites: Optional[List[int]] = None,
+        **kwargs,
+    ) -> str:
+        """按关键词创建订阅。"""
+        from app.chain.subscribe import SubscribeChain
+        from app.schemas.types import MediaType
+
+        keyword = (keyword or "").strip()
+        logger.info(
+            f"执行工具: {self.name}, 参数: title={title}, year={year}, media_type={media_type}, "
+            f"keyword={keyword}, season={season}, tmdb_id={tmdb_id}, sites={sites}"
+        )
+        if not keyword:
+            return "参数错误：keyword 不能为空，请提供用于站点搜索的自定义关键词。"
+
+        try:
+            media_type_enum = MediaType.from_agent(media_type)
+            if not media_type_enum:
+                return f"错误：无效的媒体类型 '{media_type}'，支持的类型：'movie', 'tv'"
+
+            subscribe_username = await self._resolve_subscribe_username()
+
+            subscribe_kwargs: Dict[str, Any] = {"keyword": keyword}
+            if start_episode is not None:
+                subscribe_kwargs["start_episode"] = start_episode
+            if total_episode is not None:
+                subscribe_kwargs["total_episode"] = total_episode
+            if quality:
+                subscribe_kwargs["quality"] = quality
+            if resolution:
+                subscribe_kwargs["resolution"] = resolution
+            if effect:
+                subscribe_kwargs["effect"] = effect
+            if filter_groups:
+                subscribe_kwargs["filter_groups"] = filter_groups
+            if sites:
+                subscribe_kwargs["sites"] = sites
+
+            sid, message = await SubscribeChain().async_add(
+                mtype=media_type_enum,
+                title=title,
+                year=year,
+                tmdbid=tmdb_id,
+                doubanid=douban_id,
+                bangumiid=bangumi_id,
+                anilistid=anilist_id,
+                media_source=media_source,
+                media_id=media_id,
+                season=season,
+                username=subscribe_username,
+                **subscribe_kwargs,
+            )
+            payload = {
+                "success": bool(sid),
+                "subscribe_id": sid,
+                "title": title,
+                "year": year,
+                "keyword": keyword,
+                "message": (
+                    f"已创建关键词订阅：《{title}》({year})，站点搜索关键词为「{keyword}」。"
+                    if sid
+                    else f"创建订阅失败：{message}"
+                ),
+                "note": (
+                    "该订阅将用自定义关键词在站点搜索，而非 TMDB 标题，可避免命名不规范导致的漏检。"
+                    "订阅搜索由系统定时触发；如需立即搜索，可在 MP 订阅页手动刷新。"
+                ),
+            }
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"关键词订阅失败: {e}", exc_info=True)
+            return f"关键词订阅失败: {str(e)}"
+
+
 class KeywordSearch(_PluginBase):
     """关键词搜索种子插件（为 Agent 提供 search_torrents_by_keyword 工具）"""
 
     # 插件元信息
     plugin_name = "关键词搜索种子"
     plugin_desc = (
-        "为 AI Agent 提供按关键词直接搜索站点种子的工具，弥补内置按媒体 ID 搜索的漏检问题。"
-        "支持按 movie/tv/anime 过滤与并发深度识别，便于处理同名多版本（多季/电影/动漫）结果。"
+        "为 AI Agent 提供按关键词搜索站点种子 + 按关键词创建订阅的工具，弥补内置按媒体 ID/标题搜索的漏检问题。"
+        "命名不规范时用关键词搜索/订阅，ID 仅作辅助。"
     )
     plugin_icon = "search.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     plugin_author = "local"
     plugin_config_prefix = "keywordsearch_"
     plugin_order = 50
@@ -571,7 +793,7 @@ class KeywordSearch(_PluginBase):
         """
         if not self._enabled:
             return []
-        return [SearchTorrentsByKeywordTool]
+        return [SearchTorrentsByKeywordTool, AddSubscribeByKeywordTool]
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
