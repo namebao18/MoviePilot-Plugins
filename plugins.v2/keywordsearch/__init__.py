@@ -42,7 +42,7 @@
     最终入库刮削由下载完成后的 transfer 流程按真实文件做。本搜索工具不影响
     入库刮削，只影响"搜到什么、怎么展示"。
 
-版本：1.4.0
+版本：1.5.0
 作者：local
 """
 
@@ -144,8 +144,10 @@ class SearchTorrentsByKeywordTool(MoviePilotTool):
         "PREFER this tool whenever the site naming may be non-standard / localized / "
         "aliased (indexer titles often differ from TMDB titles); it is the reliable "
         "fallback when the ID-based search misses resources. "
-        "After confirming the keyword returns the desired resources, reuse the same "
-        "keyword with `add_subscribe_by_keyword` to create a keyword-based subscription. "
+        "After confirming the keyword returns the desired resources, if the user wants "
+        "to download/subscribe, you MUST reuse the SAME keyword with "
+        "`add_subscribe_by_keyword` (NOT the plain `add_subscribe`), so the subscription "
+        "keeps searching by that keyword. "
         "IMPORTANT: keyword search does NOT identify media, so the type field is "
         "usually unknown; each result is annotated with media_kind plus type_uncertain. "
         "When the same name returns mixed versions (TV seasons / movie / anime), set "
@@ -610,13 +612,16 @@ class AddSubscribeByKeywordTool(MoviePilotTool):
     description: str = (
         "Add a media subscription that searches indexer sites by a CUSTOM KEYWORD "
         "instead of the identified title (the ID is still stored for identification). "
-        "PREFER this tool over `add_subscribe` when site naming is non-standard, "
-        "localized, aliased, or when a title-based search is likely to miss resources "
-        "— e.g. the indexer titles differ from the TMDB title, the media has a Chinese "
-        "/ alternate name, or the user explicitly gives a keyword. "
-        "Do NOT use it when the TMDB title is clean and standard (use `add_subscribe`). "
+        "IMPORTANT — after using `search_torrents_by_keyword` to locate resources, you "
+        "MUST subscribe with THIS tool (reusing the SAME keyword), not `add_subscribe`; "
+        "otherwise the subscription falls back to ID/title search and will miss the "
+        "same non-standard-titled resources you just found. "
+        "PREFER this tool over `add_subscribe` whenever: site naming is non-standard / "
+        "localized / aliased, the indexer titles differ from the TMDB title, the media "
+        "has a Chinese or alternate name, or the user explicitly gives a keyword. "
+        "Only use `add_subscribe` when the TMDB title is clean and standard. "
         "When unsure, first call `search_torrents_by_keyword` to confirm the keyword "
-        "actually returns the desired resources, then subscribe with the same keyword. "
+        "returns the desired resources, then subscribe here with the same keyword. "
         "Choose a keyword specific enough to avoid grabbing unrelated same-name works. "
         "For TV, omitting season defaults to season 1; subscribe each season separately."
     )
@@ -766,7 +771,7 @@ class KeywordSearch(_PluginBase):
         "命名不规范时用关键词搜索/订阅，ID 仅作辅助。"
     )
     plugin_icon = "search.png"
-    plugin_version = "1.4.0"
+    plugin_version = "1.5.0"
     plugin_author = "local"
     plugin_config_prefix = "keywordsearch_"
     plugin_order = 50
