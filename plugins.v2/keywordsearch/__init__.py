@@ -42,7 +42,20 @@
     最终入库刮削由下载完成后的 transfer 流程按真实文件做。本搜索工具不影响
     入库刮削，只影响"搜到什么、怎么展示"。
 
-版本：1.6.0
+版本：1.7.0（2026-09-30）
+    新增「标题相关性分级」title_match（exact/partial/none），结果按命中度排序：
+    - 背景：关键词搜索"更全"但会带回站点模糊匹配的噪音（实测「全职高手」
+      237 条里 80 条为 AUDIOBOOK 等无关内容），Agent 曾对噪音逐条深度识别，
+      卡 7 分钟无输出。
+    - 修复：① 每条结果标 title_match，按 exact→partial→none 排序（不丢任何
+      条目，none 里可能有拼音/英文别名真资源）；② recognize=true 时只识别
+      "标题命中关键词"的条目，全部未命中时才回退识别全部；③ payload 增加
+      relevance_summary + 引导语，规则 9/工具描述同步提示"别逐条识别噪音"。
+    - v1.7.0 补强（同日）：**关键词别名自动识别**（async_search 两跳拿
+      en_title，如「全职高手」→ The King's Avatar）参与 title_match 判定——
+      否则站点英文命名场景 237 条里 177 条真资源全标 none，排序失效且误导；
+      引导语按字面命中率分三档（<20% 时明示"none 多是别名真资源"）；
+      深度识别加 Semaphore(10) 防 TMDB 限流。
 作者：local
 """
 
@@ -74,6 +87,136 @@ _ANIME_KEYWORDS = (
 )
 # 单条媒体识别的超时（秒），避免个别条目卡住整体
 _RECOGNIZE_TIMEOUT = 12
+# 中文字符范围（相关性判断用）
+_CJK_RE = re.compile(r"[一-鿿]")
+# 相关性等级 → 排序权重（越小越靠前）
+_REL_RANK = {"exact": 0, "partial": 1, "none": 2}
+# 关键词别名缓存（keyword -> [别名...]），避免重复查 TMDB
+_ALIAS_CACHE: Dict[str, List[str]] = {}
+# 深度识别并发上限（防止同时打爆 TMDB 限流）
+_RECOGNIZE_CONCURRENCY = 10
+
+
+async def _keyword_aliases(keyword: str) -> List[str]:
+    """
+    查询关键词对应媒体的别名（英文原名/正式中文名），用于 title_match 匹配。
+
+    背景：站点常用英文名/别名命名（如「全职高手」→ The King's Avatar），
+    只按中文字面匹配会把 177 条真资源全标成 none，排序失效且误导。
+    两跳实现：async_search(标题) → async_recognize_media(tmdb) 拿 en_title。
+
+    :return: 别名列表（不含关键词本身）；失败/超时返回已拿到的部分或 []
+    """
+    kw = (keyword or "").strip()
+    if not kw:
+        return []
+    if kw in _ALIAS_CACHE:
+        return _ALIAS_CACHE[kw]
+    aliases: List[str] = []
+    try:
+        from app.chain.media import MediaChain
+
+        media_chain = MediaChain()
+        meta, results = await asyncio.wait_for(
+            media_chain.async_search(title=kw), timeout=10
+        )
+        if results:
+            first = results[0]
+            # 搜索结果自身的正式标题（可能与关键词不同）
+            if first.title and first.title.strip() != kw:
+                aliases.append(first.title.strip())
+            # 详情级识别拿英文原名（en_title）
+            detail = await asyncio.wait_for(
+                media_chain.async_recognize_media(
+                    tmdbid=first.tmdb_id, mtype=first.type
+                ),
+                timeout=10,
+            )
+            if detail:
+                if detail.title and detail.title.strip() != kw:
+                    aliases.append(detail.title.strip())
+                if detail.en_title:
+                    aliases.append(detail.en_title.strip())
+    except Exception as e:
+        logger.warning(f"查询关键词别名失败（忽略，按纯关键词匹配）：{kw} - {e}")
+    # 去重且排除关键词本身
+    seen = {re.sub(r"\s+", "", kw.lower())}
+    uniq: List[str] = []
+    for a in aliases:
+        key = re.sub(r"\s+", "", a.lower())
+        if key and key not in seen:
+            seen.add(key)
+            uniq.append(a)
+    _ALIAS_CACHE[kw] = uniq
+    return uniq
+
+
+def _title_relevance_best(keywords: List[str], title: str) -> str:
+    """对多个关键词（本词+别名）取最佳相关性等级。"""
+    best = "none"
+    for kw in keywords:
+        r = _title_relevance(kw, title)
+        if _REL_RANK[r] < _REL_RANK[best]:
+            best = r
+            if best == "exact":
+                break
+    return best
+
+
+def _norm_text(s: str) -> str:
+    """
+    归一化文本用于相关性比较。
+
+    小写、标点转空格、折叠空白（\w 含中文，故中文字符被保留）。
+    """
+    if not s:
+        return ""
+    s = re.sub(r"[^\w]+", " ", s.lower())
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _title_relevance(keyword: str, title: str) -> str:
+    """
+    判断种子标题与关键词的相关性等级（只排序标注，不丢弃任何结果）。
+
+    - exact：标题直接包含关键词（或关键词全部分词都在标题里）
+    - partial：部分命中（中文字符覆盖 ≥50% 且 ≥2 字，或多词关键词部分命中）
+    - none：标题不含关键词（站点模糊带回的噪音，或拼音/英文别名命名的真资源）
+
+    ⚠️ none ≠ 无用：站点可能用别名命名（如 QuanZhiGaoShou / The King's
+    Avatar），所以只降序排序 + 标注，绝不过滤删除；当 exact/partial 全为 0
+    时，调用方应视为"全部可能是别名命中"并回退处理。
+    """
+    kw = _norm_text(keyword)
+    ti = _norm_text(title)
+    if not kw or not ti:
+        return "none"
+    if kw in ti:
+        return "exact"
+    tokens = [t for t in kw.split() if t]
+    # 多词关键词：全部命中=exact，部分命中=partial
+    if len(tokens) >= 2:
+        hits = sum(1 for t in tokens if t in ti)
+        if hits == len(tokens):
+            return "exact"
+        if hits > 0:
+            return "partial"
+    # 中文关键词：按去重后字符覆盖度判 partial（如 全职高手 vs 全职大盗）
+    if _CJK_RE.search(kw):
+        chars = list(dict.fromkeys(c for c in kw if _CJK_RE.match(c)))
+        if len(chars) >= 2:
+            hit = sum(1 for c in chars if c in ti)
+            if hit >= 2 and hit * 2 >= len(chars):
+                return "partial"
+        return "none"
+    # 纯外文多词关键词：词级覆盖 ≥50%
+    words = [w for w in tokens if len(w) >= 2]
+    if len(words) >= 2:
+        ti_words = ti.split()
+        hits = sum(1 for w in words if any(w in tw for tw in ti_words))
+        if hits * 2 >= len(words):
+            return "partial"
+    return "none"
 
 
 class SearchTorrentsByKeywordInput(BaseModel):
@@ -154,7 +297,11 @@ class SearchTorrentsByKeywordTool(MoviePilotTool):
         "recognize=true to label each unique title with its exact type/year/season "
         "(slower), or set media_type to 'movie'/'tv'/'anime' to filter. "
         "IMPORTANT: Results ≤ 2 do NOT mean the resource is unavailable; try other "
-        "keywords, alternate titles, or site scope before concluding."
+        "keywords, alternate titles, or site scope before concluding. "
+        "Every result carries title_match (exact/partial/none) and the list is sorted "
+        "with exact matches FIRST: trust title_match=exact/partial entries, scan "
+        "title_match=none titles manually before spending time on them (they are site "
+        "noise or alias-named releases), and NEVER deep-recognize them one by one."
     )
     args_schema: Type[BaseModel] = SearchTorrentsByKeywordInput
 
@@ -283,13 +430,16 @@ class SearchTorrentsByKeywordTool(MoviePilotTool):
             return {}
 
         media_chain = MediaChain()
+        # 并发上限：别名接入后识别范围变大，防止同时打爆 TMDB 限流
+        semaphore = asyncio.Semaphore(_RECOGNIZE_CONCURRENCY)
 
         async def recognize_one(key: str, meta_info: Any) -> tuple:
             try:
-                result = await asyncio.wait_for(
-                    media_chain.async_recognize_by_meta(meta_info, obtain_images=False),
-                    timeout=_RECOGNIZE_TIMEOUT,
-                )
+                async with semaphore:
+                    result = await asyncio.wait_for(
+                        media_chain.async_recognize_by_meta(meta_info, obtain_images=False),
+                        timeout=_RECOGNIZE_TIMEOUT,
+                    )
                 return key, result
             except asyncio.TimeoutError:
                 logger.warning(f"关键词搜索深度识别超时（{_RECOGNIZE_TIMEOUT}s）：{key}")
@@ -402,10 +552,30 @@ class SearchTorrentsByKeywordTool(MoviePilotTool):
                 }
                 return json.dumps(payload, ensure_ascii=False, indent=2)
 
-            # 深度识别（可选）：仅对去重后的标题并发识别
+            # 关键词别名（v1.7.0：站点常用英文/别名命名，如「全职高手」→
+            # The King's Avatar，只按字面匹配会把真资源全标成 none）
+            aliases = await _keyword_aliases(keyword)
+            match_keywords = [keyword] + [a for a in aliases if a]
+
+            # 标题相关性分级（v1.7.0：排序 + 噪音标注，不丢结果）
+            rel_map: Dict[int, str] = {}
+            for idx, context in enumerate(contexts):
+                ti = getattr(context, "torrent_info", None)
+                rel_map[idx] = _title_relevance_best(
+                    match_keywords, (ti.title if ti else "") or ""
+                )
+
+            # 深度识别（可选）：仅对去重后的标题并发识别。
+            # v1.7.0 收窄识别范围：只识别"标题命中关键词"的条目（exact/partial），
+            # 避免对泛化噪音（AUDIOBOOK 等）逐条识别导致卡死（实测 237 条卡 7 分钟）；
+            # 若没有任何标题命中（全为别名命名），回退为识别全部。
             recognized_map: Dict[str, Any] = {}
             if recognize:
-                recognized_map = await self._recognize_unique_titles(contexts)
+                recognize_contexts = [
+                    ctx for idx, ctx in enumerate(contexts)
+                    if rel_map.get(idx) != "none"
+                ] or contexts
+                recognized_map = await self._recognize_unique_titles(recognize_contexts)
 
             # 为每条结果标注 media_kind
             kind_map: Dict[int, str] = {}
@@ -454,6 +624,9 @@ class SearchTorrentsByKeywordTool(MoviePilotTool):
                 return kind_map.get(idx) == media_type
 
             selected = [(idx, ctx) for idx, ctx in enumerate(contexts) if keep(idx)]
+            # v1.7.0 相关性排序：exact → partial → none（同级保持原序，绝不丢弃条目；
+            # torrent_url 里的 index 仍用原缓存序号 idx+1，与下载缓存保持一致）
+            selected.sort(key=lambda p: (_REL_RANK.get(rel_map.get(p[0], "none"), 2), p[0]))
             total_count = len(selected)
 
             # 类型分布
@@ -494,18 +667,25 @@ class SearchTorrentsByKeywordTool(MoviePilotTool):
                 if mi:
                     key = (getattr(mi, "name", None) or getattr(mi, "title", None) or "").strip()
                 media_info = recognized_map.get(key) if key else None
-                results.append(
-                    self._build_entry(
-                        ctx, idx + 1, kind_map.get(idx, "unknown"),
-                        uncertain_map.get(idx, True), media_info,
-                    )
+                entry = self._build_entry(
+                    ctx, idx + 1, kind_map.get(idx, "unknown"),
+                    uncertain_map.get(idx, True), media_info,
                 )
+                entry["title_match"] = rel_map.get(idx, "none")
+                results.append(entry)
+
+            # 相关性分布（针对过滤后、排序前统计口径=selected 全量而非当前页）
+            rel_sum: Dict[str, int] = {"exact": 0, "partial": 0, "none": 0}
+            for idx, _ in selected:
+                rel_sum[rel_map.get(idx, "none")] = rel_sum.get(rel_map.get(idx, "none"), 0) + 1
 
             payload = {
                 "total_count": total_count,
                 "keyword": keyword,
                 "filtered_by": media_type,
                 "media_kind_distribution": dist,
+                "relevance_summary": rel_sum,
+                "keyword_aliases": aliases,
                 "page": page,
                 "total_pages": total_pages,
                 "results": results,
@@ -524,6 +704,37 @@ class SearchTorrentsByKeywordTool(MoviePilotTool):
             )
             if relevance_notice:
                 payload["relevance_notice"] = relevance_notice
+            # v1.7.0 相关性引导：按字面命中率分档，避免把"别名真资源"误称为噪音
+            matched_count = rel_sum["exact"] + rel_sum["partial"]
+            if aliases:
+                payload["message"] += (
+                    f" 匹配所用别名：{'、'.join(aliases[:4])}"
+                    "（由关键词自动识别，已参与 title_match 判定）。"
+                )
+            if matched_count == 0:
+                payload["message"] += (
+                    " 无任何条目标题命中关键词或别名：结果可能仍为目标资源"
+                    "（站点拼音/生僻别名命名），不要据此判定无资源；"
+                    "请逐页查看标题自行判断，或换更贴近站点命名的关键词再搜。"
+                )
+            elif matched_count < total_count * 0.2:
+                # 字面命中少 → 站点主要用别名命名 → none 组多是真资源而非噪音
+                payload["message"] += (
+                    f" 仅 {matched_count}/{total_count} 条命中关键词/别名：站点很可能主要用"
+                    "其他别名命名，title_match=none 的条目大多是目标资源而非噪音，"
+                    "请扫标题粗筛，可用 recognize=true 区分作品，不要直接丢弃。"
+                )
+            else:
+                payload["message"] += (
+                    f" 结果已按标题相关性排序（title_match：exact {rel_sum['exact']} 条、"
+                    f"partial {rel_sum['partial']} 条在前，none {rel_sum['none']} 条在后）。"
+                    "title_match=none 的条目未命中关键词/别名，多为站点模糊带回的噪音，"
+                    "请先扫标题粗筛，不要逐条深度识别。"
+                )
+            if recognize and rel_sum["none"] > 0 and matched_count > 0:
+                payload["message"] += (
+                    f" 本次媒体识别仅覆盖标题命中关键词的条目（none 组 {rel_sum['none']} 条未识别）。"
+                )
             if not recognize:
                 payload["message"] += (
                     " 注意：本次未做媒体识别，media_kind 为启发式结果（type_uncertain=true 表示不确定）；"
@@ -791,7 +1002,7 @@ class KeywordSearch(_PluginBase):
         "命名不规范时用关键词搜索/订阅，ID 仅作辅助。"
     )
     plugin_icon = "search.png"
-    plugin_version = "1.6.0"
+    plugin_version = "1.7.0"
     plugin_author = "local"
     plugin_config_prefix = "keywordsearch_"
     plugin_order = 50

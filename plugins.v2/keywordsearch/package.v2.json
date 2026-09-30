@@ -1,7 +1,7 @@
 {
   "name": "关键词搜索种子",
   "description": "为 AI Agent 提供按关键词直接搜索站点种子的工具，弥补内置按媒体 ID 搜索的漏检问题。支持按 movie/tv/anime 过滤与深度识别，便于处理同名多版本结果。",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "icon": "search.png",
   "author": "local",
   "level": 1
