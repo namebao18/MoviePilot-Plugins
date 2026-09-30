@@ -42,7 +42,7 @@
     最终入库刮削由下载完成后的 transfer 流程按真实文件做。本搜索工具不影响
     入库刮削，只影响"搜到什么、怎么展示"。
 
-版本：1.5.0
+版本：1.6.0
 作者：local
 """
 
@@ -588,6 +588,15 @@ class AddSubscribeByKeywordInput(BaseModel):
     effect: Optional[str] = Field(None, description="Effect filter regex (optional).")
     filter_groups: Optional[List[str]] = Field(None, description="Filter rule groups (optional).")
     sites: Optional[List[int]] = Field(None, description="Site IDs to search (optional).")
+    best_version: Optional[bool] = Field(
+        True,
+        description=(
+            "Whether to enable 'best version' (洗版) for this subscription: keep upgrading "
+            "to better quality versions (e.g. 4K over 1080p) after initial download. "
+            "Defaults to TRUE for keyword subscriptions (recommended). Set false to only "
+            "fetch missing episodes without quality upgrades."
+        ),
+    )
 
 
 class AddSubscribeByKeywordTool(MoviePilotTool):
@@ -620,6 +629,9 @@ class AddSubscribeByKeywordTool(MoviePilotTool):
         "localized / aliased, the indexer titles differ from the TMDB title, the media "
         "has a Chinese or alternate name, or the user explicitly gives a keyword. "
         "Only use `add_subscribe` when the TMDB title is clean and standard. "
+        "Best-version (洗版) is enabled by DEFAULT for this keyword subscription "
+        "(pass best_version=false to disable, e.g. if the user only wants missing "
+        "episodes without quality upgrades). "
         "When unsure, first call `search_torrents_by_keyword` to confirm the keyword "
         "returns the desired resources, then subscribe here with the same keyword. "
         "Choose a keyword specific enough to avoid grabbing unrelated same-name works. "
@@ -688,6 +700,7 @@ class AddSubscribeByKeywordTool(MoviePilotTool):
         effect: Optional[str] = None,
         filter_groups: Optional[List[str]] = None,
         sites: Optional[List[int]] = None,
+        best_version: Optional[bool] = True,
         **kwargs,
     ) -> str:
         """按关键词创建订阅。"""
@@ -709,7 +722,12 @@ class AddSubscribeByKeywordTool(MoviePilotTool):
 
             subscribe_username = await self._resolve_subscribe_username()
 
-            subscribe_kwargs: Dict[str, Any] = {"keyword": keyword}
+            subscribe_kwargs: Dict[str, Any] = {
+                "keyword": keyword,
+                # 关键词订阅默认开启洗版（best_version）；用户可显式传 false 关闭。
+                # 始终传入，以覆盖系统订阅默认（系统默认可能为关闭）。
+                "best_version": bool(best_version) if best_version is not None else True,
+            }
             if start_episode is not None:
                 subscribe_kwargs["start_episode"] = start_episode
             if total_episode is not None:
@@ -745,8 +763,10 @@ class AddSubscribeByKeywordTool(MoviePilotTool):
                 "title": title,
                 "year": year,
                 "keyword": keyword,
+                "best_version": bool(best_version) if best_version is not None else True,
                 "message": (
-                    f"已创建关键词订阅：《{title}》({year})，站点搜索关键词为「{keyword}」。"
+                    f"已创建关键词订阅：《{title}》({year})，站点搜索关键词为「{keyword}」，"
+                    f"洗版(best_version)={'开启' if (best_version if best_version is not None else True) else '关闭'}。"
                     if sid
                     else f"创建订阅失败：{message}"
                 ),
@@ -771,7 +791,7 @@ class KeywordSearch(_PluginBase):
         "命名不规范时用关键词搜索/订阅，ID 仅作辅助。"
     )
     plugin_icon = "search.png"
-    plugin_version = "1.5.0"
+    plugin_version = "1.6.0"
     plugin_author = "local"
     plugin_config_prefix = "keywordsearch_"
     plugin_order = 50
