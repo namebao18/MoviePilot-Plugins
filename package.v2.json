@@ -46,5 +46,13 @@
     "icon": "autosubtitles.jpeg",
     "author": "TimoYoung (AV modified)",
     "level": 2
+  },
+  "KeywordSearch": {
+    "name": "关键词搜索种子",
+    "description": "为 AI Agent 提供按关键词直接搜索站点种子的工具，弥补内置按媒体 ID 搜索的漏检问题。",
+    "version": "1.0.0",
+    "icon": "search.png",
+    "author": "local",
+    "level": 1
   }
 }
