@@ -17,8 +17,8 @@
   },
   "WeWorkIPPW": {
     "name": "企微配置IPpw版",
-    "description": "定时获取最新动态公网IP，配置到企业微信应用的可信IP列表里。（本地改造：适配 MP 新版 AI Agent 验证码输入会话）",
-    "version": "4.1.0",
+    "description": "定时获取最新动态公网IP，配置到企业微信应用的可信IP列表里。（本地改造：适配 MP 新版 AI Agent 验证码输入会话 + 扫码登录防自动重载误杀）",
+    "version": "4.1.1",
     "icon": "micon.png",
     "author": "suraxiuxiu",
     "level": 2
@@ -49,8 +49,8 @@
   },
   "KeywordSearch": {
     "name": "关键词搜索种子",
-    "description": "为 AI Agent 提供按关键词搜索站点种子 + 按关键词创建订阅的工具（默认开洗版），弥补内置按媒体 ID/标题搜索的漏检问题。命名不规范时用关键词，ID 仅作辅助。",
-    "version": "1.7.0",
+    "description": "为 AI Agent 提供按关键词直接搜索站点种子的工具，弥补内置按媒体 ID 搜索的漏检问题。",
+    "version": "1.0.0",
     "icon": "search.png",
     "author": "local",
     "level": 1

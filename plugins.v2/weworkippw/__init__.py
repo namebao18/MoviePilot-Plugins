@@ -32,8 +32,8 @@ class WeWorkIPPW(_PluginBase):
     plugin_desc = "!!docker用户用这个版本!!定时获取最新动态公网IP，配置到企业微信应用的可信IP列表里。"
     # 插件图标
     plugin_icon = "https://github.com/suraxiuxiu/MoviePilot-Plugins/blob/main/icons/micon.png?raw=true"
-    # 插件版本（本地改造：4.1.0，适配 MP 新版 AI Agent；含登录失败退避+降噪+上限）
-    plugin_version = "4.1.0"
+    # 插件版本（本地改造：4.1.1，适配 MP 新版 AI Agent；含登录失败退避+降噪+上限+扫码防误杀）
+    plugin_version = "4.1.1"
     # 插件作者
     plugin_author = "suraxiuxiu"
     # 作者主页
@@ -111,6 +111,10 @@ class WeWorkIPPW(_PluginBase):
     # 本地改造（2026-09-20）：插件停止标志。stop_service 时置 True，
     # login() 的等待循环据此提前退出，避免 stop_service 的 scheduler.shutdown() 被长时间阻塞。
     _stop_flag = False
+    # 本地改造（2026-10-07）：是否处于扫码等待窗口（防 stop_service 误杀）
+    _awaiting_scan = False
+    # 本地改造（2026-10-07）：是否有延迟的 stop_service 请求
+    _pending_stop = False
     _driver = None
     _refresh_lock = threading.Lock()
     # 定时器
@@ -131,6 +135,9 @@ class WeWorkIPPW(_PluginBase):
         self._reset_login_backoff()
         self._clear_code_input_session()
         self._stop_flag = False
+        # 本地改造（2026-10-07）：重置扫码等待/延迟停止标志
+        self._awaiting_scan = False
+        self._pending_stop = False
         if config:
             self._enabled = config.get("enabled")
             self._check_cron = config.get("cron")
@@ -464,6 +471,10 @@ class WeWorkIPPW(_PluginBase):
             logger.info("已有登录流程正在执行，跳过本次登录")
             return
         self._login_running = True
+        # 本地改造（2026-10-07）：登录开始时重置 _stop_flag
+        # （reload 时 stop() 可能已置 True，但 job 在 stop 之后才执行，
+        #  不重置会导致登录循环立即退出）
+        self._stop_flag = False
         try:
             self._login_inner()
         finally:
@@ -504,6 +515,8 @@ class WeWorkIPPW(_PluginBase):
                         logger.info("打开插件详情扫描二维码登录企业微信")
                     else:
                         logger.info("无法下载二维码图片：", response.status_code)
+                    # 本地改造（2026-10-07）：标记进入扫码等待窗口
+                    self._awaiting_scan = True
                     try:
                         new_url = False
                         def on_new_url(frame):
@@ -514,8 +527,15 @@ class WeWorkIPPW(_PluginBase):
                         wait_time = 0
                         while not new_url:
                             # 本地改造（2026-09-20）：插件停止时提前退出，避免阻塞重载
-                            if self._stop_flag:
-                                raise ValueError("插件停止,终止登录")
+                            # 本地改造（2026-10-07）：如果 _pending_stop=True，
+                            # 说明 stop_service 是延迟停止请求（登录进行中），
+                            # 此时 _stop_flag 可能被并发置位，应忽略。
+                            # 双保险：_stop_flag 为 True 时延迟 2 秒再确认，
+                            # 给 stop_service 的 _pending_stop 置位留时间（消除竞态）。
+                            if self._stop_flag and not getattr(self, "_pending_stop", False):
+                                page.wait_for_timeout(2000)
+                                if self._stop_flag and not getattr(self, "_pending_stop", False):
+                                    raise ValueError("插件停止,终止登录")
                             page.wait_for_timeout(1000)
                             wait_time += 1
                             if wait_time > 180:
@@ -537,8 +557,12 @@ class WeWorkIPPW(_PluginBase):
                                     time.sleep(2)
                                     wait_code_time += 2
                                     # 本地改造（2026-09-20）：插件停止时提前退出
-                                    if self._stop_flag:
-                                        raise ValueError("插件停止,终止登录")
+                                    # 本地改造（2026-10-07）：延迟停止请求忽略
+                                    # 双保险：延迟 2 秒再确认（消除竞态）
+                                    if self._stop_flag and not getattr(self, "_pending_stop", False):
+                                        time.sleep(2)
+                                        if self._stop_flag and not getattr(self, "_pending_stop", False):
+                                            raise ValueError("插件停止,终止登录")
                                     if wait_code_time > 120:
                                         raise ValueError("验证超时,终止本次登录")
                                 input_element = page.locator('.inner_input')
@@ -559,6 +583,12 @@ class WeWorkIPPW(_PluginBase):
                         self._cookie_valid = True
                         # 本地改造（2026-09-20）：登录成功，重置失败退避计数与降噪标记
                         self._reset_login_backoff()
+                        self._awaiting_scan = False
+                        # 本地改造（2026-10-07）：登录结束后，若有延迟停止请求，补置 _stop_flag
+                        if getattr(self, "_pending_stop", False):
+                            logger.warning("登录成功，补置 _stop_flag")
+                            self._stop_flag = True
+                            self._pending_stop = False
                         self.post_message(channel=MessageChannel.Wechat,mtype=NotificationType.Plugin,title = "登录企业微信成功",userid=self._qr_send_users)
                         logger.info("登录企业微信成功")
                         if not self._scheduler.get_job("refresh_cookie"):
@@ -569,10 +599,17 @@ class WeWorkIPPW(_PluginBase):
                         logger.error(f"登录超时:{e}")
                         # 本地改造（2026-09-20）：异常退出时清理输入会话
                         self._clear_code_input_session()
+                        self._awaiting_scan = False
+                        # 本地改造（2026-10-07）：登录结束后，若有延迟停止请求，补置 _stop_flag
+                        if getattr(self, "_pending_stop", False):
+                            logger.warning("登录失败，补置 _stop_flag")
+                            self._stop_flag = True
+                            self._pending_stop = False
                         self.login_fail()
                 except Exception as e:
                     logger.error(f"登录失败:{e}")
                     self._clear_code_input_session()
+                    self._awaiting_scan = False
                     self.login_fail()
                 browser.close()
                 self._driver = None
@@ -1382,8 +1419,51 @@ class WeWorkIPPW(_PluginBase):
         - 浏览器由 login() 内的 with sync_playwright() 块自行关闭。
         """
         try:
+            # 本地改造（2026-10-07）：登录流程正在等待扫码时，
+            # 文件监测线程会 reload_plugin -> init_plugin -> stop_service，
+            # 直接把 _stop_flag 置位会中断登录（表现为"插件停止,终止登录"）。
+            # 此时只记录请求，等登录流程结束后再真正停止。
+            # 本地改造（2026-10-07）：检查类级别的登录状态
+            # （reload 时新实例 init_plugin 会重置实例属性，但类属性 _login_running
+            #  仍反映真实登录状态；用类属性判断才能跨实例生效）
+            # 本地改造（2026-10-07）：登录进行/排队时，不立即置 _stop_flag，
+            # 而是启动后台线程等登录结束后再置位。
+            # 背景：PLUGIN_AUTO_RELOAD 会在每次插件文件变化时 reload_plugin，
+            # 而 wwlogin 是 date job——一旦开始执行就从调度器移除，
+            # 导致 get_job("wwlogin") 恒为 None，无法靠它判断"登录即将开始"。
+            # 表现为：重载时 stop_service 置 _stop_flag=True，
+            # 随后旧实例上的登录循环检查到 True 立即退出（"插件停止,终止登录"），
+            # 用户永远等不到扫码。
+            # 本地改造（2026-10-07）：先置 _pending_stop 再检查，
+            # 消除与登录循环的竞态窗口（stop_service 检查 _awaiting_scan
+            # 时，登录循环可能还没置 _awaiting_scan=True）
+            self._pending_stop = True
+            if self._login_running or getattr(self, "_awaiting_scan", False):
+                logger.warning("登录进行中，延迟置 _stop_flag 到登录结束后")
+                # 后台等待登录结束（最多等 200s，覆盖 180s 扫码超时）
+                def _deferred_stop(inst=self):
+                    _waited = 0
+                    while (inst._login_running or getattr(inst, "_awaiting_scan", False)) and _waited < 200:
+                        time.sleep(1)
+                        _waited += 1
+                    logger.warning("登录已结束，补置 _stop_flag")
+                    inst._stop_flag = True
+                    if getattr(inst, "_pending_stop", False):
+                        inst._pending_stop = False
+                threading.Thread(target=_deferred_stop, daemon=True, name="deferred-stop").start()
+                # 仍然清理 scheduler（但不置 _stop_flag，让登录继续）
+                if self._scheduler:
+                    if self._scheduler.running:
+                        try:
+                            self._scheduler.shutdown(wait=False)
+                        except TypeError:
+                            self._scheduler.shutdown()
+                    self._scheduler = None
+                return
             self._stop_flag = True
             self._driver = None
+            # 本地改造（2026-10-07）：正常停止（非登录中），清除 _pending_stop
+            self._pending_stop = False
             if self._scheduler:
                 if self._scheduler.running:
                     try:
@@ -1391,5 +1471,9 @@ class WeWorkIPPW(_PluginBase):
                     except TypeError:
                         self._scheduler.shutdown()
                 self._scheduler = None
+            # 登录结束后有延迟停止请求，补执行
+            if getattr(self, "_pending_stop", False):
+                logger.warning(">>> 补执行延迟的 stop_service")
+                self._pending_stop = False
         except Exception as e:
             logger.error("退出插件失败：%s" % str(e))
