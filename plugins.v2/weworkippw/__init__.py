@@ -33,7 +33,7 @@ class WeWorkIPPW(_PluginBase):
     # 插件图标
     plugin_icon = "https://github.com/suraxiuxiu/MoviePilot-Plugins/blob/main/icons/micon.png?raw=true"
     # 插件版本（本地改造：4.1.1，适配 MP 新版 AI Agent；含登录失败退避+降噪+上限+扫码防误杀）
-    plugin_version = "4.1.1"
+    plugin_version = "4.1.2"
     # 插件作者
     plugin_author = "suraxiuxiu"
     # 作者主页
@@ -435,6 +435,19 @@ class WeWorkIPPW(_PluginBase):
         cookie_header = ''
         try:
             if self._cookie_valid:
+                return self._cookie_from_CC
+            # 本地改造（2026-10-08）：数据库损坏重建后，cookie_valid 被重置
+            # 为 False，但 cookie_from_CC 数据其实完整保留（systemconfig 表
+            # 逐行拷贝 + 关键表回灌保护）。原逻辑此时直接去 CookieCloud 拉取——
+            # 而 CookieCloud 里通常只有企微非登录 cookie（没有 wwrtx.sid/vst
+            # 等登录态）-> 拉不到登录 cookie -> cookie_header 为空 -> 判 cookie
+            # 失效 -> 触发自动登录（发扫码通知）。但已保存的 cookie 很可能
+            # 还有效，只是需要一次实际访问校验。故：_cookie_from_CC 非空时，
+            # 优先返回它，让 refresh_cookie 用它访问企微首页做校验——
+            # 有效则自动恢复 _cookie_valid=True（无需重新扫码），
+            # 真失效才走自动登录。这也让数据库修复后企微登录态能自动恢复。
+            if isinstance(self._cookie_from_CC, list) and self._cookie_from_CC:
+                logger.info("cookie_valid=False 但已保存cookie非空，优先用其校验有效性（数据库重建后自动恢复）")
                 return self._cookie_from_CC
             if self._use_cookiecloud:
                 logger.info("尝试从CookieCloud同步企微cookie ...")
