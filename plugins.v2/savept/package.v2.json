@@ -1,0 +1,8 @@
+{
+  "name": "PT监护室",
+  "description": "展示 PT 站点运行状态、病危通知与站庆预告。（本地修复：原版 _extract_site_cards 正则灾难性回溯，在 250KB 页面上会卡死整个 MoviePilot）",
+  "version": "1.1.2",
+  "icon": "https://raw.githubusercontent.com/KoWming/MoviePilot-Plugins/main/icons/savept.png",
+  "author": "KoWming (ReDoS fixed locally)",
+  "level": 2
+}
